@@ -1,0 +1,62 @@
+# Agent runner configuration
+# One task file (prompts/*.md) declares `project: <id>` in its front matter;
+# the resolver maps that id to a real repository path here.
+
+projects:
+
+  demo:
+    path: ./demo-repo
+    default_branch: master
+    language: markdown
+    test:
+      command: ""
+    opencode:
+      agent: build
+      model: ""
+
+  demo2:
+    path: ./demo-repo-2
+    default_branch: master
+    language: markdown
+    test:
+      command: ""
+    opencode:
+      agent: build
+      model: ""
+
+  # Example: additional projects
+  #
+  # new-api:
+  #   path: D:/Workspace/new-api
+  #   default_branch: main
+  #   language: go
+  #   test:
+  #     command: go test ./...
+  #   opencode:
+  #     agent: build
+  #     model: ""
+  #
+  # frontend:
+  #   path: D:/Workspace/frontend
+  #   default_branch: main
+  #   language: typescript
+  #   test:
+  #     command: npm run test
+  #   opencode:
+  #     agent: build
+  #     model: ""
+
+worker:
+  max_workers: 3
+  # poll_interval: 2
+
+retry:
+  max_attempts: 3
+  backoff_seconds: 10
+
+recovery:
+  lease_timeout: 300        # seconds — lease expires if no heartbeat
+  heartbeat_interval: 30    # seconds — how often workers update heartbeat
+
+opencode:
+  base_url: http://127.0.0.1:4096

@@ -1,0 +1,13 @@
+.worktrees/
+worktrees/
+processing/
+processed/
+failed/
+reports/
+logs/
+runtime/tasks.db
+runtime/tasks.db-wal
+runtime/tasks.db-shm
+__pycache__/
+*.pyc
+.venv/
