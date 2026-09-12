@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>任务详情</title>
+<link rel="stylesheet" href="/static/assets/style.css">
+<script src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js" defer></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@12/marked.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/dompurify@3/dist/purify.min.js"></script>
+</head>
+<body>
+<nav class="nav">
+  <span class="brand">LangGraph + OpenCode Runner</span>
+  <a href="/">总览</a>
+  <a href="/graph">依赖图</a>
+  <a href="/tasks">任务列表</a>
+</nav>
+
+<div class="container" x-data="detail()">
+  <template x-if="task">
+    <div>
+      <!-- 头部 -->
+      <div class="panel">
+        <div style="display:flex; align-items:center; gap:14px; flex-wrap:wrap">
+          <h2 class="mono" style="margin:0" x-text="task.id"></h2>
+          <span class="badge" :class="task.status" x-text="task.status"></span>
+          <span class="dot alive" x-show="task.liveness === 'alive'"></span>
+        </div>
+        <p class="muted" style="margin:8px 0 0" x-text="task.title"></p>
+        <table style="margin-top:14px">
+          <tbody>
+            <tr>
+              <td class="muted small">项目</td>
+              <td class="mono small" x-text="task.project"></td>
+              <td class="muted small">位置</td>
+              <td class="small" x-text="task.location"></td>
+            </tr>
+            <tr>
+              <td class="muted small">checkpoint</td>
+              <td class="mono small" x-text="task.checkpoint || '-'"></td>
+              <td class="muted small">attempt</td>
+              <td class="small" x-text="task.attempt"></td>
+            </tr>
+            <tr>
+              <td class="muted small">依赖</td>
+              <td class="small">
+                <template x-if="task.depends_on.length">
+                  <span>
+                    <template x-for="d in task.depends_on" :key="d">
+                      <a class="mono" style="margin-right:8px" :href="'/task?id=' + encodeURIComponent(d)" x-text="d"></a>
+                    </template>
+                  </span>
+                </template>
+                <span class="muted" x-show="!task.depends_on.length">（无）</span>
+              </td>
+              <td class="muted small">commit</td>
+              <td class="mono small" x-text="task.commit_sha ? task.commit_sha.slice(0, 12) : '-'"></td>
+            </tr>
+            <tr>
+              <td class="muted small">allowed_paths</td>
+              <td class="mono small" colspan="3" x-text="task.allowed_paths.join('  ') || '（任意）'"></td>
+            </tr>
+            <tr x-show="task.failure_type">
+              <td class="muted small">失败类型</td>
+              <td class="small" style="color:var(--red)" colspan="3" x-text="task.failure_type"></td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="grid-2">
+        <!-- 执行时间线（日志还原） -->
+        <div class="panel">
+          <h2>执行时间线</h2>
+          <ul class="timeline">
+            <template x-for="(e, i) in task.timeline" :key="i">
+              <li :class="cls(e)">
+                <span class="t" x-text="e.time.slice(11)"></span>
+                <span class="mono small" x-text="e.message"></span>
+              </li>
+            </template>
+          </ul>
+          <p class="muted small" x-show="task.timeline.length === 0">暂无日志记录</p>
+        </div>
+
+        <!-- 重试历史 -->
+        <div class="panel">
+          <h2>尝试历史</h2>
+          <table>
+            <thead><tr><th>#</th><th>状态</th><th>失败类型</th><th>完成时间</th></tr></thead>
+            <tbody>
+              <template x-for="a in task.attempts" :key="a.attempt">
+                <tr>
+                  <td x-text="a.attempt"></td>
+                  <td><span class="badge" :class="a.status" x-text="a.status"></span></td>
+                  <td class="small" x-text="a.failure_type || '-'"></td>
+                  <td class="small muted" x-text="(a.finished_at || '').replace('T',' ').slice(0,19)"></td>
+                </tr>
+              </template>
+            </tbody>
+          </table>
+          <p class="muted small" x-show="task.attempts.length === 0">尚无尝试记录</p>
+        </div>
+      </div>
+
+      <!-- 执行报告 -->
+      <div class="panel">
+        <h2>执行报告 <span class="muted small" x-text="'reports/' + task.id + '.md'"></span></h2>
+        <div class="report-body" x-html="reportHtml"></div>
+        <p class="muted small" x-show="reportHtml === '' && reportLoaded">无报告文件</p>
+      </div>
+    </div>
+  </template>
+  <p class="muted" x-show="notFound">任务不存在 — <a href="/tasks">返回列表</a></p>
+</div>
+
+<script>
+function detail() {
+  return {
+    task: null,
+    notFound: false,
+    reportHtml: '',
+    reportLoaded: false,
+    cls(e) {
+      if (/FAILED|crashed|error/i.test(e.message)) return 'err';
+      if (/SUCCESS/.test(e.message)) return 'ok';
+      return '';
+    },
+    async init() {
+      const id = new URLSearchParams(location.search).get('id') || '';
+      await this.load(id);
+    },
+    async load(id) {
+      try {
+        const r = await fetch('/api/tasks/' + encodeURIComponent(id));
+        if (!r.ok) { this.notFound = true; return; }
+        this.task = await r.json();
+        document.title = id + ' — 任务详情';
+        try {
+          const rr = await fetch('/api/tasks/' + encodeURIComponent(id) + '/report');
+          if (rr.ok) {
+            const d = await rr.json();
+            this.reportHtml = DOMPurify.sanitize(marked.parse(d.markdown));
+          }
+        } catch (e) { /* no report */ }
+        this.reportLoaded = true;
+      } catch (e) { console.error(e); this.notFound = true; }
+    },
+  };
+}
+</script>
+</body>
+</html>

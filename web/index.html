@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>Runner Dashboard</title>
+<link rel="stylesheet" href="/static/assets/style.css">
+<script src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js" defer></script>
+</head>
+<body>
+<nav class="nav">
+  <span class="brand">LangGraph + OpenCode Runner</span>
+  <a href="/" class="active">总览</a>
+  <a href="/graph">依赖图</a>
+  <a href="/tasks">任务列表</a>
+</nav>
+
+<div class="container" x-data="dashboard()" x-init="init()">
+  <!-- 统计卡片 -->
+  <div class="cards">
+    <template x-for="c in statCards" :key="c.label">
+      <div class="card">
+        <div class="num" x-text="c.num" :style="`color:${c.color}`"></div>
+        <div class="label" x-text="c.label"></div>
+      </div>
+    </template>
+  </div>
+
+  <div class="grid-2">
+    <!-- 活动任务 -->
+    <div class="panel">
+      <h2>运行中的任务 <span class="muted small" x-text="running.length ? '' : '（无）'"></span></h2>
+      <template x-if="running.length === 0"><p class="muted">当前没有正在执行的任务</p></template>
+      <table x-show="running.length">
+        <tbody>
+          <template x-for="t in running" :key="t.id">
+            <tr>
+              <td><a :href="'/task?id=' + encodeURIComponent(t.id)" class="mono" x-text="t.id"></a></td>
+              <td><span class="badge RUNNING">RUNNING</span></td>
+              <td class="mono small" x-text="t.checkpoint || '-'"></td>
+              <td class="small" x-text="'attempt ' + (t.attempt ?? '-')"></td>
+              <td>
+                <span class="dot alive" x-show="t.liveness === 'alive'"></span>
+                <span class="dot stale" x-show="t.liveness === 'stale'" title="heartbeat expired"></span>
+                <span class="small muted" x-text="t.liveness === 'alive' ? 'alive' : (t.liveness === 'stale' ? 'stale' : '')"></span>
+              </td>
+            </tr>
+          </template>
+        </tbody>
+      </table>
+    </div>
+
+    <!-- 队列与项目 -->
+    <div class="panel">
+      <h2>队列 / 项目</h2>
+      <p class="small muted">
+        prompts 队列：<span x-text="queue.prompts"></span>　
+        处理中：<span x-text="queue.blocked"></span>
+      </p>
+      <table>
+        <thead><tr><th>项目</th><th>任务数（按状态）</th></tr></thead>
+        <tbody>
+          <template x-for="(v, proj) in byProject" :key="proj">
+            <tr>
+              <td class="mono" x-text="proj"></td>
+              <td class="small">
+                <template x-for="(count, status) in v" :key="status">
+                  <span class="badge" :class="status" x-text="status + ' ' + count" style="margin-right:6px"></span>
+                </template>
+              </td>
+            </tr>
+          </template>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- 最近事件 -->
+  <div class="panel">
+    <h2>最近事件</h2>
+    <ul class="timeline">
+      <template x-for="(e, i) in recent" :key="i">
+        <li :class="e.message.includes('FAILED') || e.message.includes('crashed') ? 'err' : (e.message.includes('SUCCESS') ? 'ok' : '')">
+          <span class="t" x-text="e.time.slice(11)"></span>
+          <span x-text="e.message"></span>
+        </li>
+      </template>
+    </ul>
+    <p class="muted small" x-show="recent.length === 0">暂无事件</p>
+  </div>
+</div>
+
+<script>
+function dashboard() {
+  return {
+    total: 0,
+    counts: {},
+    byProject: {},
+    queue: { prompts: 0, blocked: 0 },
+    running: [],
+    recent: [],
+    get statCards() {
+      const color = { COMPLETED: 'var(--green)', RUNNING: 'var(--blue)', FAILED: 'var(--red)', PENDING: 'var(--gray)' };
+      return [
+        { num: this.total, label: '总任务', color: 'var(--text)' },
+        ...Object.entries(this.counts).map(([k, v]) => ({ num: v, label: k, color: color[k] || 'var(--text)' })),
+      ];
+    },
+    async init() {
+      await this.refresh();
+      const es = new EventSource('/api/events/stream');
+      es.onmessage = () => this.refresh();  // any store change → refresh
+      es.onerror = () => {};  // EventSource auto-reconnects
+    },
+    async refresh() {
+      try {
+        const r = await fetch('/api/summary');
+        const d = await r.json();
+        this.total = d.total;
+        this.counts = d.counts;
+        this.byProject = d.by_project;
+        this.queue = d.queue;
+        this.running = d.running;
+        this.recent = d.recent_events;
+      } catch (e) { console.error(e); }
+    },
+  };
+}
+</script>
+</body>
+</html>

@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>任务列表</title>
+<link rel="stylesheet" href="/static/assets/style.css">
+<script src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js" defer></script>
+</head>
+<body>
+<nav class="nav">
+  <span class="brand">LangGraph + OpenCode Runner</span>
+  <a href="/">总览</a>
+  <a href="/graph">依赖图</a>
+  <a href="/tasks" class="active">任务列表</a>
+</nav>
+
+<div class="container" x-data="list()">
+  <div class="filter-bar">
+    <input type="text" placeholder="搜索 id / 项目 / 标题…" x-model="search">
+    <select x-model="statusFilter">
+      <option value="">全部状态</option>
+      <template x-for="s in statuses" :key="s"><option :value="s" x-text="s"></option></template>
+    </select>
+    <select x-model="projectFilter">
+      <option value="">全部项目</option>
+      <template x-for="p in projects" :key="p"><option :value="p" x-text="p"></option></template>
+    </select>
+    <span class="muted small" style="align-self:center" x-text="filtered.length + ' 个任务'"></span>
+  </div>
+
+  <div class="panel" style="padding:0">
+    <table>
+      <thead>
+        <tr>
+          <th>ID</th><th>状态</th><th>项目</th><th>位置</th>
+          <th>checkpoint</th><th>attempt</th><th>commit</th><th>更新时间</th>
+        </tr>
+      </thead>
+      <tbody>
+        <template x-for="t in filtered" :key="t.id">
+          <tr>
+            <td>
+              <a class="mono" :href="'/task?id=' + encodeURIComponent(t.id)" x-text="t.id"></a>
+              <div class="muted small" x-text="t.title"></div>
+              <div class="muted small" x-show="t.depends_on.length" x-text="'⇠ ' + t.depends_on.join(', ')"></div>
+            </td>
+            <td><span class="badge" :class="t.status" x-text="t.status"></span></td>
+            <td class="mono small" x-text="(t.project || '?').split('/').pop()"></td>
+            <td class="small muted" x-text="t.location"></td>
+            <td class="mono small" x-text="t.checkpoint || '-'"></td>
+            <td class="small" x-text="t.attempt"></td>
+            <td class="mono small" x-show="t.commit_sha">
+              <span x-text="t.commit_sha ? t.commit_sha.slice(0, 7) : ''"></span>
+            </td>
+            <td class="small muted" x-text="fmtTime(t.updated_at)"></td>
+          </tr>
+        </template>
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<script>
+function list() {
+  return {
+    tasks: [],
+    search: '',
+    statusFilter: '',
+    projectFilter: '',
+    get statuses() { return [...new Set(this.tasks.map(t => t.status))].sort(); },
+    get projects() { return [...new Set(this.tasks.map(t => t.project).filter(Boolean))].sort(); },
+    get filtered() {
+      const q = this.search.toLowerCase();
+      return this.tasks.filter(t =>
+        (!this.statusFilter || t.status === this.statusFilter) &&
+        (!this.projectFilter || t.project === this.projectFilter) &&
+        (!q || t.id.toLowerCase().includes(q) ||
+          (t.project || '').toLowerCase().includes(q) ||
+          (t.title || '').toLowerCase().includes(q))
+      );
+    },
+    fmtTime(iso) {
+      if (!iso) return '-';
+      return iso.replace('T', ' ').slice(0, 19);
+    },
+    async init() {
+      await this.refresh();
+      const es = new EventSource('/api/events/stream');
+      es.onmessage = () => this.refresh();
+    },
+    async refresh() {
+      try {
+        const r = await fetch('/api/tasks');
+        this.tasks = await r.json();
+      } catch (e) { console.error(e); }
+    },
+  };
+}
+</script>
+</body>
+</html>

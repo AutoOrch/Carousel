@@ -1,0 +1,115 @@
+:root {
+  --bg: #0f1420;
+  --panel: #171e2e;
+  --panel-2: #1e2740;
+  --border: #2a3550;
+  --text: #dbe4f5;
+  --muted: #7c8bb0;
+  --green: #34d399;
+  --blue: #60a5fa;
+  --gray: #6b7a9e;
+  --red: #f87171;
+  --amber: #fbbf24;
+  --purple: #c084fc;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  font-family: "Segoe UI", system-ui, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+}
+
+a { color: var(--blue); text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+.nav {
+  display: flex;
+  gap: 20px;
+  align-items: center;
+  padding: 14px 24px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--border);
+}
+
+.nav .brand { font-weight: 700; font-size: 16px; color: var(--text); }
+.nav a { color: var(--muted); font-size: 14px; }
+.nav a.active, .nav a:hover { color: var(--text); }
+
+.container { max-width: 1200px; margin: 0 auto; padding: 24px; }
+
+.cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 14px; margin-bottom: 24px; }
+
+.card {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 16px 18px;
+}
+
+.card .num { font-size: 30px; font-weight: 700; }
+.card .label { color: var(--muted); font-size: 13px; margin-top: 4px; }
+
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 18px;
+  margin-bottom: 24px;
+}
+
+.panel h2 { margin: 0 0 14px; font-size: 16px; font-weight: 600; }
+
+table { width: 100%; border-collapse: collapse; font-size: 14px; }
+th { text-align: left; color: var(--muted); font-weight: 500; padding: 8px 10px; border-bottom: 1px solid var(--border); }
+td { padding: 8px 10px; border-bottom: 1px solid var(--border); vertical-align: top; }
+tr:hover td { background: var(--panel-2); }
+
+.badge {
+  display: inline-block;
+  padding: 2px 10px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 600;
+}
+.badge.COMPLETED { background: rgba(52,211,153,.15); color: var(--green); }
+.badge.RUNNING   { background: rgba(96,165,250,.15); color: var(--blue); }
+.badge.PENDING   { background: rgba(107,122,158,.15); color: var(--gray); }
+.badge.FAILED    { background: rgba(248,113,113,.15); color: var(--red); }
+.badge.UNKNOWN   { background: rgba(107,122,158,.15); color: var(--gray); }
+
+.mono { font-family: Consolas, monospace; font-size: 13px; }
+.muted { color: var(--muted); }
+.small { font-size: 12px; }
+
+.grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; }
+@media (max-width: 900px) { .grid-2 { grid-template-columns: 1fr; } }
+
+.filter-bar { display: flex; gap: 10px; margin-bottom: 16px; flex-wrap: wrap; }
+.filter-bar input, .filter-bar select {
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: 8px;
+  padding: 8px 12px;
+  font-size: 14px;
+}
+
+.timeline { list-style: none; padding: 0; margin: 0; }
+.timeline li { padding: 6px 0 6px 18px; border-left: 2px solid var(--border); position: relative; font-size: 13px; }
+.timeline li::before { content: ""; position: absolute; left: -6px; top: 12px; width: 10px; height: 10px; border-radius: 50%; background: var(--blue); }
+.timeline li.ok::before { background: var(--green); }
+.timeline li.err::before { background: var(--red); }
+.timeline .t { color: var(--muted); margin-right: 8px; font-family: Consolas, monospace; }
+
+.report-body { line-height: 1.65; font-size: 14px; }
+.report-body h2 { border-bottom: 1px solid var(--border); padding-bottom: 6px; margin-top: 22px; }
+.report-body code { background: var(--panel-2); padding: 1px 6px; border-radius: 4px; font-family: Consolas, monospace; font-size: 13px; }
+.report-body pre { background: var(--panel-2); padding: 12px; border-radius: 8px; overflow-x: auto; }
+
+.dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; }
+.dot.alive { background: var(--green); animation: pulse 1.5s infinite; }
+.dot.stale { background: var(--red); }
+@keyframes pulse { 50% { opacity: .4; } }

@@ -154,6 +154,8 @@ langgraph-opencode/
 │   └── task.py          # Task（含 allowed_paths, depends_on, simulate_failure）
 ├── scripts/
 │   └── package_code.py  # 源码打包（见「源码打包」）
+├── dashboard.py         # Web Dashboard 入口（FastAPI 只读 + SSE）
+├── web/                 # Dashboard 静态页面（index/graph/tasks/task.html）
 ├── prompts/ processing/ processed/ failed/
 ├── reports/             # 每任务执行报告（OpenCode 反馈/诊断/commit）
 ├── worktrees/           # worktrees/<project>/<task_id>/
@@ -427,6 +429,29 @@ API 调用要点（实测验证）：
 |---|------|--------|
 | 1 | 无测试套件 | 中 |
 | 2 | MemorySaver → SqliteSaver（进程重启后 checkpoint 恢复） | 中 |
+
+## Dashboard 可视化
+
+`dashboard.py` 提供只读 Web UI（FastAPI + 无构建静态页），可视化任务状态、依赖图、执行历史和 OpenCode 反馈：
+
+```powershell
+.\.venv\Scripts\python.exe dashboard.py            # http://127.0.0.1:8080
+.\.venv\Scripts\python.exe dashboard.py --port 9000
+```
+
+| 页面 | 路径 | 内容 |
+|------|------|------|
+| 总览 | `/` | 统计卡片、运行中任务（checkpoint/心跳活性）、队列/项目计数、最近事件流 |
+| 依赖图 | `/graph` | 任务 DAG（Mermaid），状态着色、跨项目虚线框、缺失依赖红虚线 |
+| 任务列表 | `/tasks` | 全部任务，搜索 + 状态/项目过滤 |
+| 任务详情 | `/task?id=…` | 元信息、执行时间线（日志还原）、尝试历史、报告渲染（markdown + DOMPurify 防注入） |
+
+特性：
+
+- **实时更新**：SSE（`/api/events/stream`）每 2s 检测 tasks 表变化并推送，前端 EventSource 自动重连
+- **只读安全**：dashboard 只读 SQLite（WAL 模式下与 watcher 读写互不阻塞），所有写操作仍归 watcher
+- **API 独立可用**：`/api/summary`、`/api/tasks`、`/api/tasks/{id}`、`/api/tasks/{id}/report`、`/api/graph`、`/api/projects`（FastAPI 自带 `/docs` 交互文档）
+- 依赖：`fastapi` + `uvicorn`（已入 requirements.txt），前端库全走 CDN
 
 ## 故障排查
 

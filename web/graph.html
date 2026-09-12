@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>依赖图</title>
+<link rel="stylesheet" href="/static/assets/style.css">
+<script src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js" defer></script>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+</head>
+<body>
+<nav class="nav">
+  <span class="brand">LangGraph + OpenCode Runner</span>
+  <a href="/">总览</a>
+  <a href="/graph" class="active">依赖图</a>
+  <a href="/tasks">任务列表</a>
+</nav>
+
+<div class="container" x-data="graph()">
+  <div class="panel">
+    <h2>任务依赖 DAG</h2>
+    <p class="small muted">
+      <span class="dot" style="background:var(--green)"></span>COMPLETED
+      <span class="dot" style="background:var(--blue)"></span>RUNNING
+      <span class="dot" style="background:var(--gray)"></span>PENDING / UNKNOWN
+      <span class="dot" style="background:var(--red)"></span>FAILED
+      　·　虚线边框 = 跨项目任务　·　红色虚线边 = 依赖缺失
+    </p>
+    <div id="mermaid-wrap" style="overflow-x:auto">
+      <pre class="mermaid" x-html="mermaidSrc"></pre>
+    </div>
+    <p class="muted small" x-show="!loaded">加载中…</p>
+    <p class="muted small" x-show="loaded && nodes.length === 0">暂无任务</p>
+  </div>
+</div>
+
+<script>
+function graph() {
+  return {
+    nodes: [],
+    edges: [],
+    loaded: false,
+    mermaidSrc: '',
+    async init() {
+      await this.refresh();
+      const es = new EventSource('/api/events/stream');
+      es.onmessage = () => this.refresh();
+    },
+    async refresh() {
+      try {
+        const r = await fetch('/api/graph');
+        const d = await r.json();
+        this.nodes = d.nodes;
+        this.edges = d.edges;
+        this.render();
+        this.loaded = true;
+      } catch (e) { console.error(e); }
+    },
+    render() {
+      if (this.nodes.length === 0) { this.mermaidSrc = ''; return; }
+      const fill = {
+        COMPLETED: '#12291f', RUNNING: '#16233d', PENDING: '#1b2130',
+        FAILED: '#2d1414', UNKNOWN: '#1b2130',
+      };
+      const stroke = {
+        COMPLETED: '#34d399', RUNNING: '#60a5fa', PENDING: '#6b7a9e',
+        FAILED: '#f87171', UNKNOWN: '#6b7a9e',
+      };
+      const projects = new Set(this.nodes.map(n => n.project));
+      const multiProject = projects.size > 1;
+
+      let src = 'flowchart LR\n';
+      for (const n of this.nodes) {
+        const label = n.label.length > 34 ? n.label.slice(0, 33) + '…' : n.label;
+        const attrs = [
+          `fill:${fill[n.status] || fill.UNKNOWN}`,
+          `stroke:${stroke[n.status] || stroke.UNKNOWN}`,
+          `stroke-width:1.5px`,
+          `color:#dbe4f5`,
+        ];
+        if (multiProject && n.project !== [...projects][0]) attrs.push('stroke-dasharray:6 3');
+        src += `  ${JSON.stringify(n.id)}["${label}<br/><small>${n.status}</small>"]\n`;
+        src += `  style ${JSON.stringify(n.id)} ${attrs.join(',')}\n`;
+      }
+      for (const e of this.edges) {
+        src += `  ${JSON.stringify(e.from)} ${e.known ? '-->' : '-. missing .->'} ${JSON.stringify(e.to)}\n`;
+      }
+      this.mermaidSrc = src;
+      this.$nextTick(async () => {
+        mermaid.initialize({ startOnLoad: false, theme: 'dark', securityLevel: 'loose' });
+        await mermaid.run({ nodes: [document.querySelector('pre.mermaid')] });
+      });
+    },
+  };
+}
+</script>
+</body>
+</html>
