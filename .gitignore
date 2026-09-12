@@ -11,3 +11,5 @@ runtime/tasks.db-shm
 __pycache__/
 *.pyc
 .venv/
+scripts/
+langgraph-opencode-source-bundle.txt

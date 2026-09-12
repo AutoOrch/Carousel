@@ -128,7 +128,7 @@ prompts/*.md ──► Task Scanner ──► Task Resolver ──► Worker Poo
 ## 目录结构
 
 ```text
-langgraph-opencode-demo/
+langgraph-opencode/
 ├── config.yaml          # 项目 + 重试 + 恢复配置
 ├── watcher.py           # 入口（轮询 + 恢复 + Worker Pool）
 ├── planner.py           # Planner 入口（需求 .md → task .md）
@@ -152,6 +152,8 @@ langgraph-opencode-demo/
 │   └── diagnoser.py        # 失败诊断
 ├── schemas/
 │   └── task.py          # Task（含 allowed_paths, depends_on, simulate_failure）
+├── scripts/
+│   └── package_code.py  # 源码打包（见「源码打包」）
 ├── prompts/ processing/ processed/ failed/
 ├── reports/             # 每任务执行报告（OpenCode 反馈/诊断/commit）
 ├── worktrees/           # worktrees/<project>/<task_id>/
@@ -449,3 +451,43 @@ Move-Item .\failed\task-001-*.md .\prompts\
 # 3. 重新执行
 .\.venv\Scripts\python.exe watcher.py --mode opencode --once
 ```
+
+## 源码打包
+
+`scripts/package_code.py` 将当前实现源码打包为单个可分享的文本文件（约 120KB），方便把整个 runner 发给 LLM 或他人 review。
+
+```powershell
+# 默认输出到项目根：langgraph-opencode-source-bundle.txt
+.\.venv\Scripts\python.exe scripts\package_code.py
+
+# 自定义输出位置
+.\.venv\Scripts\python.exe scripts\package_code.py --output D:\Temp\runner-code.txt
+
+# 附带演示仓库 README
+.\.venv\Scripts\python.exe scripts\package_code.py --with-demo-repos
+```
+
+**包含**（27 个文件，仅实现代码）：
+
+| 分类 | 文件 |
+|------|------|
+| 入口 | `watcher.py`、`planner.py`、`main.py`、`graph.py` |
+| 核心 | `config.py`、`config.yaml`、`task_graph.py`、`opencode_client.py`、`worktree.py`、`log.py`、`setup_demo_repo.py` |
+| runtime/ | `watcher`、`task_resolver`、`task_store`、`recovery_manager`、`file_lock_manager`、`worker_pool`、`__init__` |
+| workers/ | `opencode_worker`、`merge_agent`、`diagnoser`、`__init__` |
+| schemas/ | `task.py`、`__init__` |
+| 文档/元 | `requirements.txt`、`.gitignore`、`README.md` |
+
+**排除**（运行时产物与无关文件）：
+
+```text
+prompts/ processing/ processed/ failed/   # 任务生命周期目录
+reports/                                  # 执行报告
+worktrees/ logs/                          # worktree 与日志
+runtime/tasks.db                          # SQLite 状态库
+.venv/ __pycache__/ .git/                 # 环境
+oc_stdout.txt oc_stderr.txt               # 调试输出
+demo-repo/ demo-repo-2/                   # 演示仓库（--with-demo-repos 可附带 README）
+```
+
+输出格式：文件头（根目录/生成时间/文件数）+ 每个文件一段（`#### FILE: <相对路径>` 分隔），缺失文件输出告警。
