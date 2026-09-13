@@ -67,6 +67,7 @@ def resolve_task(task_file: Path, config: Config) -> Task:
         raw_deps = [raw_deps]
 
     simulate_failure = int(meta.get("simulate_failure", 0) or 0)
+    run_id = str(meta.get("run_id", "") or "")
 
     return Task(
         id=task_file.stem,
@@ -82,6 +83,7 @@ def resolve_task(task_file: Path, config: Config) -> Task:
         allowed_paths=list(raw_paths),
         depends_on=list(raw_deps),
         simulate_failure=simulate_failure,
+        run_id=run_id,
     )
 
 

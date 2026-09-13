@@ -52,6 +52,39 @@ CREATE TABLE IF NOT EXISTS attempts (
     finished_at      TEXT,
     PRIMARY KEY (task_id, attempt)
 );
+
+CREATE TABLE IF NOT EXISTS requirement_runs (
+    run_id           TEXT PRIMARY KEY,
+    requirement_file TEXT NOT NULL,
+    requirement_hash TEXT,
+    project          TEXT NOT NULL,
+    base_revision    TEXT,
+    final_revision   TEXT,
+    status           TEXT NOT NULL DEFAULT 'PLANNED',
+    review_status    TEXT,
+    coverage_score   REAL,
+    risk_level       TEXT,
+    planner_mode     TEXT,
+    round            INTEGER NOT NULL DEFAULT 1,
+    created_at       TEXT NOT NULL,
+    updated_at       TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS requirement_reviews (
+    review_id          TEXT PRIMARY KEY,
+    run_id             TEXT NOT NULL,
+    round              INTEGER NOT NULL DEFAULT 1,
+    base_revision      TEXT,
+    final_revision     TEXT,
+    status             TEXT NOT NULL,
+    report_path        TEXT,
+    json_path          TEXT,
+    coverage_score     REAL,
+    risk_level         TEXT,
+    followup_generated INTEGER NOT NULL DEFAULT 0,
+    created_at         TEXT NOT NULL,
+    updated_at         TEXT NOT NULL
+);
 """
 
 
@@ -78,17 +111,24 @@ class TaskStore:
         }
         if "response" not in columns:
             self._conn.execute("ALTER TABLE attempts ADD COLUMN response TEXT")
+        task_columns = {
+            row[1] for row in self._conn.execute("PRAGMA table_info(tasks)")
+        }
+        if "run_id" not in task_columns:
+            self._conn.execute("ALTER TABLE tasks ADD COLUMN run_id TEXT")
 
     # ------------------------------------------------------------------ basic
 
-    def create_task(self, task_id: str, prompt_file: str, project: str) -> None:
+    def create_task(
+        self, task_id: str, prompt_file: str, project: str, run_id: str = ""
+    ) -> None:
         with self._lock:
             self._conn.execute(
                 """INSERT OR REPLACE INTO tasks
-                   (task_id, prompt_file, project, status, attempt,
+                   (task_id, prompt_file, project, status, attempt, run_id,
                     created_at, updated_at)
-                   VALUES (?, ?, ?, 'RUNNING', 0, ?, ?)""",
-                (task_id, prompt_file, project, _now(), _now()),
+                   VALUES (?, ?, ?, 'RUNNING', 0, ?, ?, ?)""",
+                (task_id, prompt_file, project, run_id or None, _now(), _now()),
             )
             self._conn.commit()
 
@@ -237,6 +277,162 @@ class TaskStore:
                 "SELECT * FROM tasks WHERE status = 'RUNNING'"
             ).fetchall()
         return [dict(r) for r in rows]
+
+    # ------------------------------------------------------- requirement runs
+
+    def create_run(
+        self,
+        run_id: str,
+        requirement_file: str,
+        requirement_hash: str,
+        project: str,
+        base_revision: str,
+        planner_mode: str,
+    ) -> None:
+        now = _now()
+        with self._lock:
+            self._conn.execute(
+                """INSERT OR REPLACE INTO requirement_runs
+                   (run_id, requirement_file, requirement_hash, project,
+                    base_revision, status, planner_mode, round,
+                    created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, 'PLANNED', ?, 1, ?, ?)""",
+                (run_id, requirement_file, requirement_hash, project,
+                 base_revision, planner_mode, now, now),
+            )
+            self._conn.commit()
+
+    def get_run(self, run_id: str) -> dict | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM requirement_runs WHERE run_id = ?", (run_id,)
+            ).fetchone()
+        return dict(row) if row else None
+
+    def update_run(self, run_id: str, **fields: object) -> None:
+        """Update arbitrary columns on a requirement run row."""
+        if not fields:
+            return
+        allowed = {
+            "status", "review_status", "final_revision", "coverage_score",
+            "risk_level", "round",
+        }
+        cols, vals = [], []
+        for key, value in fields.items():
+            if key in allowed:
+                cols.append(f"{key} = ?")
+                vals.append(value)
+        if not cols:
+            return
+        vals.extend([_now(), run_id])
+        with self._lock:
+            self._conn.execute(
+                f"""UPDATE requirement_runs
+                    SET {', '.join(cols)}, updated_at = ?
+                    WHERE run_id = ?""",
+                vals,
+            )
+            self._conn.commit()
+
+    def find_run_by_requirement(
+        self, requirement_file: str, project: str
+    ) -> dict | None:
+        """Latest run for a requirement file + project, if any."""
+        with self._lock:
+            row = self._conn.execute(
+                """SELECT * FROM requirement_runs
+                   WHERE requirement_file = ? AND project = ?
+                   ORDER BY created_at DESC LIMIT 1""",
+                (requirement_file, project),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def get_run_tasks(self, run_id: str) -> list[dict]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM tasks WHERE run_id = ? ORDER BY created_at",
+                (run_id,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def runs_needing_review(self) -> list[dict]:
+        """Runs whose tasks are all COMPLETED and that await final review.
+
+        A run qualifies when it has at least one task, every task is
+        COMPLETED, and its status is still PLANNED/EXECUTING (i.e. not
+        already reviewed to a terminal state for the current round).
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                """SELECT r.* FROM requirement_runs r
+                   WHERE r.status IN ('PLANNED', 'EXECUTING')
+                     AND EXISTS (SELECT 1 FROM tasks t WHERE t.run_id = r.run_id)
+                     AND NOT EXISTS (
+                         SELECT 1 FROM tasks t
+                         WHERE t.run_id = r.run_id
+                           AND t.status != 'COMPLETED'
+                     )"""
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def runs_with_failed_tasks(self) -> list[dict]:
+        """Runs whose tasks all reached a terminal state but at least one FAILED.
+
+        Such a run can never satisfy its requirement as-is; the caller marks
+        it FAILED so it does not linger in EXECUTING forever.  Requeueing a
+        failed task file (prompts/) re-opens the run.
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                """SELECT r.* FROM requirement_runs r
+                   WHERE r.status IN ('PLANNED', 'EXECUTING')
+                     AND EXISTS (
+                         SELECT 1 FROM tasks t
+                         WHERE t.run_id = r.run_id AND t.status = 'FAILED'
+                     )
+                     AND NOT EXISTS (
+                         SELECT 1 FROM tasks t
+                         WHERE t.run_id = r.run_id
+                           AND t.status NOT IN ('COMPLETED', 'FAILED')
+                     )"""
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def record_review(
+        self,
+        review_id: str,
+        run_id: str,
+        round_: int,
+        status: str,
+        report_path: str,
+        json_path: str,
+        coverage_score: float,
+        risk_level: str,
+        followup_generated: bool,
+        base_revision: str,
+        final_revision: str,
+    ) -> None:
+        now = _now()
+        with self._lock:
+            self._conn.execute(
+                """INSERT OR REPLACE INTO requirement_reviews
+                   (review_id, run_id, round, status, report_path, json_path,
+                    coverage_score, risk_level, followup_generated,
+                    base_revision, final_revision, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (review_id, run_id, round_, status, report_path, json_path,
+                 coverage_score, risk_level, int(followup_generated),
+                 base_revision, final_revision, now, now),
+            )
+            self._conn.commit()
+
+    def get_review_count(self, run_id: str) -> int:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COUNT(*) FROM requirement_reviews WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+        return int(row[0]) if row else 0
 
     def close(self) -> None:
         self._conn.close()

@@ -43,7 +43,14 @@ def claim_task(config: Config, task_store: TaskStore) -> Task | None:
             task_id=task.id,
             prompt_file=str(target),
             project=task.project,
+            run_id=task.run_id,
         )
+        if task.run_id:
+            # First claim of this run's tasks moves it out of PLANNED.
+            # Requeueing a task of a FAILED / NEEDS_REPLAN run re-opens it.
+            run = task_store.get_run(task.run_id)
+            if run and run["status"] in ("PLANNED", "FAILED", "NEEDS_REPLAN"):
+                task_store.update_run(task.run_id, status="EXECUTING")
         return task
     return None
 

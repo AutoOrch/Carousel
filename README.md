@@ -145,17 +145,20 @@ langgraph-opencode/
 │   ├── recovery_manager.py  # 崩溃恢复 + 心跳
 │   ├── file_lock_manager.py # 资源锁
 │   ├── worker_pool.py   # 线程池 + 锁/依赖感知 + Lease
-│   └── tasks.db         # SQLite 数据库（gitignored）
+│   └── tasks.db         # SQLite 数据库（gitignored；含 requirement_runs/reviews）
 ├── workers/
 │   ├── opencode_worker.py  # 在 worktree 中调用 OpenCode
 │   ├── merge_agent.py      # 冲突解决
-│   └── diagnoser.py        # 失败诊断
+│   ├── diagnoser.py        # 失败诊断
+│   └── requirement_closure.py  # 最终需求审查 + 补充规划
 ├── schemas/
 │   └── task.py          # Task（含 allowed_paths, depends_on, simulate_failure）
 ├── scripts/
 │   └── package_code.py  # 源码打包（见「源码打包」）
 ├── dashboard.py         # Web Dashboard 入口（FastAPI 只读 + SSE）
 ├── web/                 # Dashboard 静态页面（index/graph/tasks/task.html）
+├── requirement_run.py   # Requirement Run 管理（run_id/快照/plan.json）
+├── requirement_closure.py  # 最终需求审查 CLI（Requirement Closure）
 ├── prompts/ processing/ processed/ failed/
 ├── reports/             # 每任务执行报告（OpenCode 反馈/诊断/commit）
 ├── worktrees/           # worktrees/<project>/<task_id>/
@@ -429,6 +432,83 @@ API 调用要点（实测验证）：
 |---|------|--------|
 | 1 | 无测试套件 | 中 |
 | 2 | MemorySaver → SqliteSaver（进程重启后 checkpoint 恢复） | 中 |
+
+## 最终需求闭环审查（Requirement Closure）
+
+「所有任务 COMPLETED」≠「原始需求完成」。Requirement Closure 在所有任务执行、测试、提交、合并完成后，重新对比五类证据，判断需求是否真正闭环：
+
+```text
+原始需求 vs 任务计划 vs 任务报告 vs Git 实际变更 vs 最终测试结果
+```
+
+### 流程
+
+```text
+planner.py（创建 Requirement Run：run_id + 需求快照 + base revision）
+    ↓
+watcher.py --once（执行全部任务）
+    ↓
+所有任务 COMPLETED
+    ↓
+Final Requirement Reviewer（自动触发）
+    ↓
+┌────────────┬─────────────┬─────────────┐
+COMPLETE   PARTIAL/FAILED   BLOCKED
+    ↓           ↓               ↓
+Run 关闭   生成补充任务      等待人工
+              → prompts/ → 执行 → 再次审查（≤ max_rounds 轮）
+```
+
+### 审查内容
+
+| 维度 | 检查 |
+|------|------|
+| 需求覆盖 | 原始需求拆成 R-001…R-NNN，逐项给出状态 + 证据等级（A~E） |
+| 代码证据 | Agent 声称的 CHANGED_FILES vs Git 实际 diff（AGENT_DIFF_MISMATCH） |
+| 跨任务集成 | 接口/字段/状态/调用链一致性 |
+| 回归风险 | 旧逻辑破坏、兼容路径遗漏、无关修改 |
+| 最终测试 | 审查前运行项目 `test.command`（`final_review.require_tests`） |
+
+### 产物
+
+```text
+reports/<run_id>-final-review-r<N>.md    # 人类可读（需求项表/风险表/补充任务）
+reports/<run_id>-final-review-r<N>.json  # 结构化（coverage/requirements/risks/followup_tasks）
+runtime/requirement_runs/<run_id>/       # 需求快照 + plan.json（含 base revisions）
+SQLite: requirement_runs / requirement_reviews 表
+```
+
+### 使用
+
+```powershell
+# 1. 规划（自动创建 Run）
+.\.venv\Scripts\python.exe planner.py --requirement ..\res.md --project D:\Workspace\resource --mode opencode
+
+# 2. 执行 + 自动触发最终审查（final_review.enabled: true）
+.\.venv\Scripts\python.exe watcher.py --mode opencode --once
+
+# 或手动/单独审查
+.\.venv\Scripts\python.exe requirement_closure.py --list
+.\.venv\Scripts\python.exe requirement_closure.py --run-id run-20260912-103000 --mode opencode
+.\.venv\Scripts\python.exe requirement_closure.py --requirement ..\res.md --project D:\Workspace\resource --mode opencode
+```
+
+审查结论：`COMPLETE` / `PARTIAL` / `FAILED` / `BLOCKED` / `RISK_ACCEPTED`。非完成结论且 `auto_replan: true` 时自动生成补充任务（带 `run_id`，编号全局递增，不重复生成整批任务）。
+
+### 配置
+
+```yaml
+final_review:
+  enabled: true          # watcher --once 完成后自动触发
+  auto_replan: true      # PARTIAL/FAILED 时自动生成补充任务
+  max_rounds: 3          # 最大闭环轮数
+  require_tests: true    # 审查前执行项目 test.command
+  fail_on_high_risk: true  # COMPLETE 但存在 high 风险时降级处理
+  reviewer_agent: plan
+  reviewer_model: ""
+```
+
+> dry-run 测试：`CLOSURE_SIMULATE=partial` 环境变量让首轮审查模拟 PARTIAL，可端到端验证补充任务→执行→二审闭环。
 
 ## Dashboard 可视化
 

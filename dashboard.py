@@ -143,6 +143,21 @@ def _liveness(task: dict[str, Any]) -> str:
         return "unknown"
 
 
+def _canonical_project(ref: str | None) -> str:
+    """Normalise a project reference to its canonical id.
+
+    Front-matter carries the raw ref (often a path like ``D:/Workspace/Talen``)
+    while the DB stores the canonical id (directory name, e.g. ``Talen``).
+    Both must map to the same key or the same project splits into two rows.
+    """
+    if not ref:
+        return "unknown"
+    ref = str(ref).replace("\\", "/").rstrip("/")
+    if "/" in ref:
+        return ref.rsplit("/", 1)[-1] or "unknown"
+    return ref
+
+
 def _build_task_view() -> list[dict[str, Any]]:
     """Merge DB rows with front-matter data into the task list view."""
     db_rows = {r["task_id"]: r for r in _read_db()}
@@ -153,10 +168,12 @@ def _build_task_view() -> list[dict[str, Any]]:
     for task_id in all_ids:
         db = db_rows.get(task_id)
         fm = fm_rows.get(task_id)
+        raw_ref = (fm or {}).get("project") or (db or {}).get("project")
         entry: dict[str, Any] = {
             "id": task_id,
             "title": fm["title"] if fm else task_id,
-            "project": (fm or {}).get("project") or (db or {}).get("project"),
+            "project": _canonical_project(raw_ref),
+            "project_ref": raw_ref,
             "location": (fm or {}).get("location", "gone"),
             "depends_on": (fm or {}).get("depends_on", []),
             "allowed_paths": (fm or {}).get("allowed_paths", []),
@@ -303,14 +320,20 @@ def api_projects() -> list[dict[str, Any]]:
     tasks = _build_task_view()
     for p in projects:
         p["tasks"] = [t["id"] for t in tasks if t["project"] == p["id"]]
-    # ad-hoc path projects (not in config.yaml)
+    # ad-hoc path projects (not in config.yaml) — keep the raw ref as path
     known = {p["id"] for p in projects}
+    refs: dict[str, str] = {}
     for t in tasks:
         proj = t["project"]
         if proj and proj not in known and proj != "unknown":
-            projects.append({"id": proj, "path": proj, "branch": "?",
-                             "tasks": [x["id"] for x in tasks if x["project"] == proj]})
-            known.add(proj)
+            refs.setdefault(proj, str(t.get("project_ref") or proj))
+    for proj, ref in refs.items():
+        projects.append({
+            "id": proj,
+            "path": ref,
+            "branch": "?",
+            "tasks": [t["id"] for t in tasks if t["project"] == proj],
+        })
     return projects
 
 

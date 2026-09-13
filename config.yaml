@@ -60,3 +60,12 @@ recovery:
 
 opencode:
   base_url: http://127.0.0.1:4096
+
+final_review:
+  enabled: true          # watcher --once 完成后自动触发最终需求审查
+  auto_replan: true      # PARTIAL/FAILED 时自动生成补充任务
+  max_rounds: 3          # 最大闭环轮数（防止无限循环）
+  require_tests: true    # 审查前执行项目 test.command
+  fail_on_high_risk: true
+  reviewer_agent: plan
+  reviewer_model: ""

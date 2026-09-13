@@ -38,6 +38,17 @@ class Project:
 
 
 @dataclass
+class FinalReviewConfig:
+    enabled: bool = True
+    auto_replan: bool = True
+    max_rounds: int = 3
+    require_tests: bool = True
+    fail_on_high_risk: bool = True
+    reviewer_agent: str = "plan"
+    reviewer_model: str = ""
+
+
+@dataclass
 class Config:
     projects: dict[str, Project] = field(default_factory=dict)
     max_workers: int = DEFAULT_MAX_WORKERS
@@ -47,6 +58,7 @@ class Config:
     backoff_seconds: float = 10.0
     lease_timeout: int = 300        # seconds before a lease is considered stale
     heartbeat_interval: int = 30    # seconds between heartbeat updates
+    final_review: FinalReviewConfig = field(default_factory=FinalReviewConfig)
 
 
 def load_config() -> Config:
@@ -79,6 +91,17 @@ def load_config() -> Config:
     opencode = data.get("opencode") or {}
     retry = data.get("retry") or {}
     recovery = data.get("recovery") or {}
+    final_review = data.get("final_review") or {}
+
+    fr = FinalReviewConfig(
+        enabled=bool(final_review.get("enabled", True)),
+        auto_replan=bool(final_review.get("auto_replan", True)),
+        max_rounds=int(final_review.get("max_rounds", 3)),
+        require_tests=bool(final_review.get("require_tests", True)),
+        fail_on_high_risk=bool(final_review.get("fail_on_high_risk", True)),
+        reviewer_agent=str(final_review.get("reviewer_agent", "plan")),
+        reviewer_model=str(final_review.get("reviewer_model", "")),
+    )
 
     return Config(
         projects=projects,
@@ -89,6 +112,7 @@ def load_config() -> Config:
         backoff_seconds=float(retry.get("backoff_seconds", 10.0)),
         lease_timeout=int(recovery.get("lease_timeout", 300)),
         heartbeat_interval=int(recovery.get("heartbeat_interval", 30)),
+        final_review=fr,
     )
 
 

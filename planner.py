@@ -232,12 +232,13 @@ def _renumber(tasks: list[dict[str, Any]], start: int) -> list[dict[str, Any]]:
 
     LLM-generated ids (and the dry-run canned ids) restart at 001 every run,
     which collides with historical batches.  This gives every generated task
-    a globally unique, monotonically increasing number.
+    a globally unique, monotonically increasing number.  Follow-up ids
+    (``followup-NNN-slug``) keep their slug but lose the prefix.
     """
     id_map: dict[str, str] = {}
     for i, t in enumerate(tasks):
         old = str(t.get("id") or f"task-{start + i}")
-        m = re.match(r"task-\d+-(.+)$", old)
+        m = re.match(r"task-\d+-(.+)$", old) or re.match(r"followup-\d+-(.+)$", old)
         if m:
             slug = m.group(1)
         else:
@@ -252,7 +253,7 @@ def _renumber(tasks: list[dict[str, Any]], start: int) -> list[dict[str, Any]]:
 
 
 def write_tasks(
-    tasks: list[dict[str, Any]], default_project: str
+    tasks: list[dict[str, Any]], default_project: str, run_id: str = ""
 ) -> list[Path]:
     """Write task dicts as .md files with front-matter into prompts/.
 
@@ -274,6 +275,8 @@ def write_tasks(
         # valid YAML; refs are normalised to forward slashes).
         project_ref = project_ref.replace("\\", "/")
         fm_lines = [f'project: "{project_ref}"']
+        if run_id:
+            fm_lines.append(f"run_id: {run_id}")
         if t.get("allowed_paths"):
             fm_lines.append("allowed_paths:")
             for p in t["allowed_paths"]:
@@ -377,19 +380,61 @@ def main() -> None:
     for ref, project, _ in projects:
         logger.info(f"[planner] project {project.id}: {project.path} (branch={project.default_branch})")
 
+    # Fail fast when the OpenCode Server is down — otherwise the planner
+    # blocks on a 1800s HTTP timeout with no feedback.
+    if args.mode == "opencode":
+        from opencode_client import OpenCodeClient
+
+        try:
+            health = OpenCodeClient(base_url=config.opencode_url).health()
+            logger.info(f"[planner] OpenCode health: {health}")
+        except Exception as exc:
+            logger.error(f"OpenCode Server unavailable: {config.opencode_url} ({exc})")
+            logger.error("Start it first:  opencode serve --hostname 127.0.0.1 --port 4096")
+            raise SystemExit(2)
+
+    from runtime.task_store import TaskStore
+    import requirement_run
+
+    task_store = TaskStore()
+    try:
+        run_id = requirement_run.create_run(
+            task_store,
+            req_path,
+            requirement,
+            projects=[
+                {"ref": norm, "id": project.id, "path": str(project.path),
+                 "branch": project.default_branch}
+                for _, project, norm in projects
+            ],
+            planner_mode=args.mode,
+        )
+    except Exception as exc:
+        logger.warning(f"[planner] could not create requirement run: {exc}")
+        run_id = ""
+
     tasks = plan(
         requirement,
         projects,
         mode=args.mode,
         opencode_url=config.opencode_url,
     )
-    logger.info(f"[planner] generated {len(tasks)} task(s)")
+    logger.info(f"[planner] generated {len(tasks)} task(s) (run_id={run_id or 'none'})")
     for t in tasks:
         logger.info(f"[planner]   - {t.get('id')}: project={t.get('project', '(default)')}")
 
-    written = write_tasks(tasks, projects[0][2])
+    written = write_tasks(tasks, projects[0][2], run_id=run_id)
+    if run_id:
+        requirement_run.save_plan_tasks(run_id, tasks)
+    task_store.close()
+
     logger.info(f"[planner] wrote {len(written)} file(s) to {PROMPTS_DIR.resolve()}")
     logger.info("[planner] run `python watcher.py --mode dry-run --once` to execute")
+    if run_id:
+        logger.info(
+            "[planner] after tasks finish, the final requirement review runs "
+            "automatically (or: python requirement_closure.py --run-id " + run_id + ")"
+        )
 
 
 if __name__ == "__main__":

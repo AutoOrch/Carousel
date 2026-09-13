@@ -25,3 +25,4 @@ class Task:
     allowed_paths: list[str] = field(default_factory=list)
     depends_on: list[str] = field(default_factory=list)
     simulate_failure: int = 0  # dry-run: fail on first N attempts (0 = never)
+    run_id: str = ""           # requirement run this task belongs to

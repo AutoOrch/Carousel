@@ -31,7 +31,11 @@
           <tbody>
             <tr>
               <td class="muted small">项目</td>
-              <td class="mono small" x-text="task.project"></td>
+              <td class="mono small">
+                <span x-text="task.project"></span>
+                <span class="muted" x-show="task.project_ref && task.project_ref !== task.project"
+                      x-text="'  (' + task.project_ref + ')'"></span>
+              </td>
               <td class="muted small">位置</td>
               <td class="small" x-text="task.location"></td>
             </tr>
