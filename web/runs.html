@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>需求运行</title>
+<link rel="stylesheet" href="/static/assets/style.css">
+<script src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js" defer></script>
+</head>
+<body>
+<nav class="nav">
+  <span class="brand">LangGraph + OpenCode Runner</span>
+  <a href="/">总览</a><a href="/runs" class="active">需求运行</a>
+  <a href="/graph">依赖图</a><a href="/tasks">任务列表</a><a href="/operations">阻塞与恢复</a>
+</nav>
+<div class="container" x-data="runsPage()" x-init="load()">
+  <div class="panel">
+    <h2>Requirement Runs</h2>
+    <table>
+      <thead><tr><th>Run</th><th>状态</th><th>项目</th><th>轮次</th><th>覆盖率</th><th>风险</th><th>任务</th></tr></thead>
+      <tbody>
+        <template x-for="run in runs" :key="run.run_id">
+          <tr>
+            <td><button class="mono" @click="select(run.run_id)" x-text="run.run_id"></button></td>
+            <td><span class="badge" :class="run.status" x-text="run.status"></span></td>
+            <td x-text="run.projects.map(p => p.project_id).join(', ') || run.project"></td>
+            <td x-text="run.round"></td><td x-text="run.coverage_score ?? '-' "></td>
+            <td x-text="run.risk_level || '-'"></td>
+            <td class="mono small" x-text="JSON.stringify(run.task_counts)"></td>
+          </tr>
+        </template>
+      </tbody>
+    </table>
+  </div>
+  <div class="panel" x-show="detail">
+    <h2>运行详情</h2>
+    <p class="mono" x-text="detail?.run_id"></p>
+    <p><a :href="'/api/runs/'+encodeURIComponent(detail?.run_id)+'/export?format=json'">导出 JSON</a> ·
+      <a :href="'/api/runs/'+encodeURIComponent(detail?.run_id)+'/export?format=md'">导出 Markdown</a></p>
+    <h3>项目版本</h3>
+    <template x-for="p in detail?.projects || []" :key="p.project_id">
+      <p><strong x-text="p.project_id"></strong>：<span class="mono small" x-text="(p.base_revision||'').slice(0,12)+' → '+(p.final_revision||'').slice(0,12)"></span></p>
+    </template>
+    <h3>计划</h3>
+    <template x-for="p in detail?.plans || []" :key="p.plan_id">
+      <div><strong x-text="'Round '+p.round"></strong>
+        <span class="badge" :class="p.status" x-text="p.status"></span>
+        <span class="small mono" x-text="(p.tasks||[]).map(t=>t.task_id).join(' → ')"></span></div>
+    </template>
+    <h3>任务</h3>
+    <template x-for="t in detail?.tasks || []" :key="t.task_id">
+      <p><a :href="'/task?id=' + encodeURIComponent(t.task_id)" class="mono" x-text="t.task_id"></a>
+        <span class="badge" :class="t.status" x-text="t.status"></span></p>
+    </template>
+    <h3>终审与需求项</h3>
+    <template x-for="r in detail?.reviews || []" :key="r.review_id">
+      <div><p><strong x-text="'Round '+r.round"></strong> · <span class="badge" :class="r.status" x-text="r.status"></span></p>
+        <template x-for="item in r.items || []" :key="item.requirement_item_id">
+          <p class="small"><span class="mono" x-text="item.requirement_item_id"></span> · <span x-text="item.status"></span> · evidence <span x-text="item.evidence_grade||'-'"></span></p>
+        </template>
+      </div>
+    </template>
+    <h3>资产</h3>
+    <template x-for="a in detail?.artifacts || []" :key="a.artifact_id">
+      <p class="small"><span x-text="a.kind"></span> · <span class="mono" x-text="a.path"></span> · <span x-text="a.status"></span></p>
+    </template>
+    <h3>事件时间线</h3>
+    <template x-for="e in detail?.events || []" :key="e.event_id">
+      <p class="small"><span class="mono" x-text="e.occurred_at"></span> ·
+        <strong x-text="e.event_type"></strong> · <span x-text="e.status || ''"></span></p>
+    </template>
+  </div>
+</div>
+<script>
+function runsPage(){return {runs:[],detail:null,async load(){this.runs=await (await fetch('/api/runs')).json()},async select(id){this.detail=await (await fetch('/api/runs/'+encodeURIComponent(id))).json()}}}
+</script>
+</body></html>

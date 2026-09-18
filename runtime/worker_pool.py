@@ -12,7 +12,7 @@ from config import FAILED_DIR, PROCESSING_DIR, PROMPTS_DIR
 from log import get_logger
 from runtime.file_lock_manager import FileLockManager
 from runtime.task_store import TaskStore
-from schemas.task import Task
+from schemas.task import TASK_TYPE_ARCHITECTURE_INIT, Task
 from task_graph import build_task_graph, set_task_store
 
 logger = get_logger(__name__)
@@ -27,6 +27,10 @@ class WorkerPool:
       (or can never run again), dependents are cascade-failed.
     * Each running task gets a lease (fencing token) so crash-recovery can
       detect stale workers.
+    * While an ``ARCHITECTURE_INIT`` task for a project is pending or
+      running, CODE_CHANGE tasks of the same project are held back (p10
+      §17 — architecture analysis reads the repo and must not race with
+      code modifications).
     """
 
     def __init__(
@@ -34,6 +38,7 @@ class WorkerPool:
         max_workers: int = 3,
         lock_manager: FileLockManager | None = None,
         task_store: TaskStore | None = None,
+        heartbeat_interval: int = 30,
     ) -> None:
         self._executor = ThreadPoolExecutor(max_workers=max_workers)
         self._lock_manager = lock_manager or FileLockManager()
@@ -49,10 +54,32 @@ class WorkerPool:
         self._idle = threading.Event()
         self._idle.set()
         self._worker_id = f"worker-{uuid.uuid4().hex[:6]}"
+        # Projects with a pending/running ARCHITECTURE_INIT task (p10 §17).
+        self._arch_projects: set[str] = set()
+        self._active_leases: dict[str, str] = {}
+        self._heartbeat_interval = max(1, heartbeat_interval)
+        self._heartbeat_stop = threading.Event()
+        self._heartbeat_thread = threading.Thread(
+            target=self._heartbeat_loop, daemon=True, name="worker-heartbeat"
+        )
+        self._heartbeat_thread.start()
 
     def submit(self, task: Task) -> None:
         with self._guard:
+            if task.type == TASK_TYPE_ARCHITECTURE_INIT:
+                self._arch_projects.add(task.project)
             self._pending.append(task)
+            cycle = self._dependency_cycle()
+            if cycle:
+                logger.error(f"[pool] dependency cycle rejected: {sorted(cycle)}")
+                doomed = [t for t in self._pending if t.id in cycle]
+                self._pending = [t for t in self._pending if t.id not in cycle]
+                for item in doomed:
+                    if self._task_store:
+                        self._task_store.transition_task(
+                            item.id, "FAILED", "dependency cycle"
+                        )
+                    _move_to_failed(item.prompt_file)
             self._dispatch_locked()
 
     def join(self) -> None:
@@ -60,9 +87,38 @@ class WorkerPool:
         self._idle.wait()
 
     def shutdown(self) -> None:
+        self._heartbeat_stop.set()
+        self._heartbeat_thread.join(timeout=5)
         self._executor.shutdown(wait=True)
 
     # -- internal ----------------------------------------------------------
+
+    def _dependency_cycle(self) -> set[str]:
+        graph = {t.id: [d for d in t.depends_on] for t in self._pending}
+        visiting: list[str] = []
+        visited: set[str] = set()
+        for start in graph:
+            stack: list[tuple[str, int]] = [(start, 0)]
+            while stack:
+                node, index = stack[-1]
+                if node in visited:
+                    stack.pop()
+                    continue
+                if node not in visiting:
+                    visiting.append(node)
+                deps = [d for d in graph.get(node, []) if d in graph]
+                if index < len(deps):
+                    dep = deps[index]
+                    stack[-1] = (node, index + 1)
+                    if dep in visiting:
+                        return set(visiting[visiting.index(dep):])
+                    if dep not in visited:
+                        stack.append((dep, 0))
+                else:
+                    visiting.remove(node)
+                    visited.add(node)
+                    stack.pop()
+        return set()
 
     def _dependency_state(self, task: Task) -> str:
         """Classify a task's dependencies.
@@ -99,9 +155,22 @@ class WorkerPool:
             f"[pool] {task.id} cascade-failed: dependencies "
             f"{task.depends_on} can never complete"
         )
+        if task.type == TASK_TYPE_ARCHITECTURE_INIT:
+            self._release_arch_project(task)
         if self._task_store:
-            self._task_store.update_status(task.id, "FAILED")
+            self._task_store.transition_task(
+                task.id, "FAILED", "dependency can never complete"
+            )
         _move_to_failed(task.prompt_file)
+
+    def _release_arch_project(self, task: Task) -> None:
+        """Stop blocking CODE_CHANGE tasks once no arch-init remains for it."""
+        still_queued = any(
+            t.type == TASK_TYPE_ARCHITECTURE_INIT and t.project == task.project
+            for t in self._pending
+        )
+        if not still_queued:
+            self._arch_projects.discard(task.project)
 
     def _dispatch_locked(self) -> None:
         still_pending: list[Task] = []
@@ -111,7 +180,27 @@ class WorkerPool:
                 self._cascade_fail(task)
                 continue
             if dep_state == "waiting":
+                if self._task_store:
+                    self._task_store.transition_task(
+                        task.id, "BLOCKED", "waiting for dependencies: "
+                        + ",".join(task.depends_on)
+                    )
                 logger.info(f"[pool] {task.id} waiting for dependencies: {task.depends_on}")
+                still_pending.append(task)
+                continue
+            if (
+                task.type != TASK_TYPE_ARCHITECTURE_INIT
+                and task.project in self._arch_projects
+            ):
+                # p10 §17: no CODE_CHANGE while the project's architecture
+                # initialisation is pending/running.
+                logger.info(
+                    f"[pool] {task.id} waiting for architecture init of {task.project}"
+                )
+                if self._task_store:
+                    self._task_store.transition_task(
+                        task.id, "BLOCKED", f"waiting for architecture init: {task.project}"
+                    )
                 still_pending.append(task)
                 continue
             if self._lock_manager.acquire(task):
@@ -121,11 +210,16 @@ class WorkerPool:
                 lease_id = ""
                 if self._task_store:
                     lease_id = self._task_store.claim_lease(task.id, self._worker_id)
+                    self._active_leases[task.id] = lease_id
 
                 logger.info(f"[pool] dispatching {task.id} (lease={lease_id})")
                 future = self._executor.submit(self._run, task, lease_id)
                 future.add_done_callback(lambda f, t=task: self._on_done(t))
             else:
+                if self._task_store:
+                    self._task_store.transition_task(
+                        task.id, "BLOCKED", "waiting for resource lock"
+                    )
                 logger.info(f"[pool] {task.id} waiting for resources: {task.allowed_paths}")
                 still_pending.append(task)
         self._pending = still_pending
@@ -135,6 +229,9 @@ class WorkerPool:
 
     def _on_done(self, task: Task) -> None:
         with self._guard:
+            if task.type == TASK_TYPE_ARCHITECTURE_INIT:
+                self._release_arch_project(task)
+            self._active_leases.pop(task.id, None)
             self._lock_manager.release(task)
             self._running -= 1
             self._dispatch_locked()
@@ -144,8 +241,17 @@ class WorkerPool:
     def _run(self, task: Task, lease_id: str) -> dict[str, Any]:
         config = {"configurable": {"thread_id": task.id}}
         try:
+            stored = self._task_store.get_task(task.id) if self._task_store else {}
             return self._graph.invoke(
-                {"task": task, "_lease_id": lease_id},
+                {
+                    "task": task,
+                    "_lease_id": lease_id,
+                    "_worker_id": self._worker_id,
+                    "attempt": int((stored or {}).get("attempt") or 0),
+                    "attempt_id": str((stored or {}).get("current_attempt_id") or ""),
+                    "resume_checkpoint": str((stored or {}).get("checkpoint") or ""),
+                    "commit": (stored or {}).get("commit_sha"),
+                },
                 config=config,
             )
         except Exception as exc:
@@ -158,6 +264,19 @@ class WorkerPool:
             # failed/ so it does not stay orphaned in processing/.
             _move_to_failed(task.prompt_file)
             return {"task": task.id, "error": str(exc)}
+
+    def _heartbeat_loop(self) -> None:
+        while not self._heartbeat_stop.wait(self._heartbeat_interval):
+            if not self._task_store:
+                continue
+            with self._guard:
+                leases = list(self._active_leases.items())
+            for task_id, lease_id in leases:
+                ok = self._task_store.update_heartbeat(
+                    task_id, self._worker_id, lease_id
+                )
+                if not ok:
+                    logger.warning(f"[pool] {task_id} heartbeat rejected (lease lost)")
 
 
 def _move_to_failed(prompt_file: Path) -> None:

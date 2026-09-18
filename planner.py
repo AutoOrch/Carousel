@@ -17,7 +17,9 @@ import argparse
 import os
 import re
 import sqlite3
+import shutil
 import sys
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -195,6 +197,67 @@ def _assign_projects(
     return tasks
 
 
+def validate_plan(
+    tasks: list[dict[str, Any]], *, allowed_projects: set[str] | None = None,
+    allowed_dependency_ids: set[str] | None = None,
+) -> list[dict[str, Any]]:
+    """Validate and normalise an LLM plan before it reaches the queue."""
+    if not tasks:
+        raise ValueError("planner returned an empty task list")
+    ids: list[str] = []
+    for index, task in enumerate(tasks, 1):
+        if not isinstance(task, dict):
+            raise ValueError(f"task {index} is not an object")
+        task_id = str(task.get("id") or "").strip()
+        prompt = str(task.get("prompt") or "").strip()
+        if not task_id or not prompt:
+            raise ValueError(f"task {index} requires non-empty id and prompt")
+        if task_id in ids:
+            raise ValueError(f"duplicate task id: {task_id}")
+        ids.append(task_id)
+        task["id"] = task_id
+        task["prompt"] = prompt
+        if allowed_projects is not None and str(task.get("project") or "") not in allowed_projects:
+            raise ValueError(f"{task_id} has project outside this run: {task.get('project')}")
+        for field in ("allowed_paths", "depends_on"):
+            value = task.get(field) or []
+            if isinstance(value, str):
+                value = [value]
+            if not isinstance(value, list):
+                raise ValueError(f"{task_id}.{field} must be a list")
+            task[field] = [str(x).strip() for x in value if str(x).strip()]
+        for path in task["allowed_paths"]:
+            candidate = Path(path.replace("\\", "/"))
+            if candidate.is_absolute() or ".." in candidate.parts:
+                raise ValueError(f"{task_id} has unsafe allowed_path: {path}")
+
+    known = set(ids) | (allowed_dependency_ids or set())
+    for task in tasks:
+        unknown = [d for d in task["depends_on"] if d not in known]
+        if unknown:
+            raise ValueError(f"{task['id']} has unknown dependencies: {unknown}")
+
+    graph = {t["id"]: list(t["depends_on"]) for t in tasks}
+    visiting: set[str] = set()
+    visited: set[str] = set()
+
+    def visit(node: str) -> None:
+        if node in visiting:
+            raise ValueError(f"dependency cycle detected at {node}")
+        if node in visited:
+            return
+        visiting.add(node)
+        for dep in graph[node]:
+            if dep in graph:
+                visit(dep)
+        visiting.remove(node)
+        visited.add(node)
+
+    for node in graph:
+        visit(node)
+    return tasks
+
+
 _SEQ_RE = re.compile(r"task-(\d+)-")
 
 
@@ -264,34 +327,51 @@ def write_tasks(
     start = _max_existing_seq() + 1
     tasks = _renumber(tasks, start)
     logger.info(f"[planner] numbering tasks {start:03d}..{start + len(tasks) - 1:03d}")
-    written: list[Path] = []
-    for t in tasks:
-        task_id = t["id"]
-        filename = f"{task_id}.md"
-        filepath = PROMPTS_DIR / filename
+    stage_dir = PROMPTS_DIR / ".staging" / f"plan-{run_id or uuid.uuid4().hex}"
+    stage_dir.mkdir(parents=True, exist_ok=False)
+    staged: list[tuple[Path, Path]] = []
+    published: list[Path] = []
+    try:
+        for t in tasks:
+            task_id = t["id"]
+            filename = f"{task_id}.md"
+            filepath = PROMPTS_DIR / filename
+            if filepath.exists():
+                raise FileExistsError(f"task queue target already exists: {filepath}")
 
-        project_ref = str(t.get("project") or default_project)
-        # Build front-matter (project is quoted so paths with spaces stay
-        # valid YAML; refs are normalised to forward slashes).
-        project_ref = project_ref.replace("\\", "/")
-        fm_lines = [f'project: "{project_ref}"']
-        if run_id:
-            fm_lines.append(f"run_id: {run_id}")
-        if t.get("allowed_paths"):
-            fm_lines.append("allowed_paths:")
-            for p in t["allowed_paths"]:
-                fm_lines.append(f"  - {p}")
-        if t.get("depends_on"):
-            fm_lines.append("depends_on:")
-            for d in t["depends_on"]:
-                fm_lines.append(f"  - {d}")
-        fm_lines.append(f"simulate_failure: {t.get('simulate_failure', 0)}")
+            project_ref = str(t.get("project") or default_project).replace("\\", "/")
+            fm_lines = [f'project: "{project_ref}"']
+            if run_id:
+                fm_lines.append(f"run_id: {run_id}")
+            if t.get("allowed_paths"):
+                fm_lines.append("allowed_paths:")
+                fm_lines.extend(f"  - {p}" for p in t["allowed_paths"])
+            if t.get("depends_on"):
+                fm_lines.append("depends_on:")
+                fm_lines.extend(f"  - {d}" for d in t["depends_on"])
+            fm_lines.append(f"simulate_failure: {t.get('simulate_failure', 0)}")
+            fm_lines.append(
+                f"allow_empty: {'true' if t.get('allow_empty', False) else 'false'}"
+            )
+            front_matter = "---\n" + "\n".join(fm_lines) + "\n---\n\n"
+            staged_path = stage_dir / filename
+            staged_path.write_text(front_matter + t["prompt"], encoding="utf-8")
+            staged.append((staged_path, filepath))
 
-        front_matter = "---\n" + "\n".join(fm_lines) + "\n---\n\n"
-        filepath.write_text(front_matter + t["prompt"], encoding="utf-8")
-        written.append(filepath)
-        logger.info(f"[planner] wrote {filepath.name}")
-    return written
+        # Filenames are globally unique. If a publish rename fails, remove the
+        # already published members so a partial plan never becomes claimable.
+        for staged_path, filepath in staged:
+            staged_path.replace(filepath)
+            published.append(filepath)
+        for filepath in published:
+            logger.info(f"[planner] wrote {filepath.name}")
+        return published
+    except Exception:
+        for filepath in published:
+            filepath.unlink(missing_ok=True)
+        raise
+    finally:
+        shutil.rmtree(stage_dir, ignore_errors=True)
 
 
 def _extract_title(text: str) -> str | None:
@@ -410,22 +490,43 @@ def main() -> None:
             planner_mode=args.mode,
         )
     except Exception as exc:
-        logger.warning(f"[planner] could not create requirement run: {exc}")
-        run_id = ""
+        task_store.close()
+        raise RuntimeError(f"could not create tracked requirement run: {exc}") from exc
 
-    tasks = plan(
-        requirement,
-        projects,
-        mode=args.mode,
-        opencode_url=config.opencode_url,
-    )
+    try:
+        tasks = validate_plan(
+            plan(requirement, projects, mode=args.mode, opencode_url=config.opencode_url),
+            allowed_projects={item[2] for item in projects},
+        )
+    except Exception as exc:
+        if run_id:
+            task_store.update_run(run_id, status="PLANNING_FAILED")
+            task_store.append_event(
+                "run.planning.failed", run_id=run_id, status="PLANNING_FAILED",
+                payload={"error": str(exc)[:2000]},
+            )
+        task_store.close()
+        raise
     logger.info(f"[planner] generated {len(tasks)} task(s) (run_id={run_id or 'none'})")
     for t in tasks:
         logger.info(f"[planner]   - {t.get('id')}: project={t.get('project', '(default)')}")
 
-    written = write_tasks(tasks, projects[0][2], run_id=run_id)
-    if run_id:
-        requirement_run.save_plan_tasks(run_id, tasks)
+    written: list[Path] = []
+    try:
+        written = write_tasks(tasks, projects[0][2], run_id=run_id)
+        if run_id:
+            requirement_run.save_plan_tasks(run_id, tasks, task_store=task_store)
+            task_store.update_run(run_id, status="QUEUED")
+    except Exception as exc:
+        for path in written:
+            path.unlink(missing_ok=True)
+        task_store.update_run(run_id, status="PLANNING_FAILED")
+        task_store.append_event(
+            "run.plan.publish.failed", run_id=run_id, status="PLANNING_FAILED",
+            payload={"error": str(exc)[:2000]},
+        )
+        task_store.close()
+        raise
     task_store.close()
 
     logger.info(f"[planner] wrote {len(written)} file(s) to {PROMPTS_DIR.resolve()}")

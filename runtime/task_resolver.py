@@ -5,7 +5,7 @@ from pathlib import Path
 import yaml
 
 from config import Config, get_project
-from schemas.task import Task
+from schemas.task import VALID_TASK_TYPES, TASK_TYPE_CODE_CHANGE, Task
 
 
 def parse_markdown(text: str) -> tuple[dict, str]:
@@ -61,13 +61,25 @@ def resolve_task(task_file: Path, config: Config) -> Task:
     raw_paths = meta.get("allowed_paths") or []
     if isinstance(raw_paths, str):
         raw_paths = [raw_paths]
+    for item in raw_paths:
+        candidate = Path(str(item).replace("\\", "/"))
+        if candidate.is_absolute() or ".." in candidate.parts:
+            raise ValueError(f"unsafe allowed_path '{item}' in {task_file.name}")
 
     raw_deps = meta.get("depends_on") or []
     if isinstance(raw_deps, str):
         raw_deps = [raw_deps]
+    if task_file.stem in [str(x) for x in raw_deps]:
+        raise ValueError(f"task cannot depend on itself: {task_file.name}")
 
     simulate_failure = int(meta.get("simulate_failure", 0) or 0)
     run_id = str(meta.get("run_id", "") or "")
+    task_type = str(meta.get("type", TASK_TYPE_CODE_CHANGE) or TASK_TYPE_CODE_CHANGE).upper()
+    if task_type not in VALID_TASK_TYPES:
+        raise ValueError(
+            f"invalid task type '{task_type}' in {task_file.name} "
+            f"(expected one of {', '.join(VALID_TASK_TYPES)})"
+        )
 
     return Task(
         id=task_file.stem,
@@ -76,6 +88,7 @@ def resolve_task(task_file: Path, config: Config) -> Task:
         project_path=project.path,
         base_branch=project.default_branch,
         prompt=body,
+        type=task_type,
         title=_extract_title(body, task_file.stem),
         test_command=project.test_command,
         agent=project.agent,
@@ -84,6 +97,7 @@ def resolve_task(task_file: Path, config: Config) -> Task:
         depends_on=list(raw_deps),
         simulate_failure=simulate_failure,
         run_id=run_id,
+        allow_empty=bool(meta.get("allow_empty", False)),
     )
 
 

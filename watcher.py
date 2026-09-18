@@ -5,6 +5,7 @@ import os
 import signal
 import sys
 import time
+from pathlib import Path
 
 from config import PROMPTS_DIR, load_config
 from log import get_logger, setup_logging
@@ -13,9 +14,43 @@ from runtime.recovery_manager import RecoveryManager
 from runtime.task_store import TaskStore
 from runtime.watcher import claim_task
 from runtime.worker_pool import WorkerPool
+from runtime.singleton import SingletonLock
+from config import DATA_ROOT, config_version
 
 logger = get_logger(__name__)
 _running = True
+
+
+def _reload_safe_config(config, current_hash: str, task_store):
+    """Reload fields that do not change worker or repository ownership."""
+    new_hash = config_version()
+    if new_hash == current_hash:
+        return config, current_hash
+    updated = load_config()
+    safe_fields = (
+        "poll_interval", "opencode_url", "max_attempts", "backoff_seconds",
+        "final_review", "documents",
+    )
+    for field in safe_fields:
+        setattr(config, field, getattr(updated, field))
+    os.environ["OPENCODE_URL"] = config.opencode_url
+    os.environ["MAX_ATTEMPTS"] = str(config.max_attempts)
+    os.environ["BACKOFF_SECONDS"] = str(config.backoff_seconds)
+    os.environ["RUNNER_CONFIG_HASH"] = new_hash
+    restart_required = []
+    for field in ("projects", "max_workers", "lease_timeout", "heartbeat_interval", "architecture"):
+        if getattr(config, field) != getattr(updated, field):
+            restart_required.append(field)
+    task_store.append_event(
+        "config.changed", status="APPLIED",
+        payload={"config_hash": new_hash, "safe_fields": list(safe_fields),
+                 "restart_required": restart_required},
+    )
+    logger.info(
+        f"[watcher] reloaded safe config fields (hash={new_hash[:12]}); "
+        f"restart_required={restart_required or 'none'}"
+    )
+    return config, new_hash
 
 
 def _handle_sigint(signum, frame) -> None:
@@ -55,9 +90,9 @@ def _run_final_reviews(
     # Runs whose tasks all finished but some FAILED → mark run FAILED so it
     # does not linger in EXECUTING (requeueing the task file re-opens it).
     for run in task_store.runs_with_failed_tasks():
-        task_store.update_run(run["run_id"], status="FAILED")
+        task_store.update_run(run["run_id"], status="EXECUTION_FAILED")
         logger.warning(
-            f"[watcher] run {run['run_id']} marked FAILED "
+            f"[watcher] run {run['run_id']} marked EXECUTION_FAILED "
             "(task failure — requeue the failed task file to reopen)"
         )
 
@@ -93,6 +128,60 @@ def _run_final_reviews(
         pool.join()
 
 
+def _ensure_auto_architecture_tasks(config, task_store) -> None:
+    """p10 §5: projects with architecture.auto_initialize get an init task
+    generated automatically at watcher startup when no baseline exists."""
+    try:
+        from architecture_init import generate_task_file
+    except ImportError:
+        return
+    for pid, project in config.projects.items():
+        arch = project.architecture
+        if not (arch.enabled and arch.auto_initialize):
+            continue
+        if task_store.get_latest_architecture(pid):
+            continue  # baseline already exists
+        if (PROMPTS_DIR / f"arch-init-{pid}.md").exists():
+            continue  # task already queued
+        generate_task_file(pid, project)
+
+
+def _reconcile_architecture(config, task_store) -> None:
+    """Keep the DB index aligned with published architecture assets."""
+    from architecture.repository import ArchitectureRepository
+    from worktree import run_git
+    repository = ArchitectureRepository(config.architecture)
+    for pid, project in config.projects.items():
+        try:
+            if repository.reconcile_publish(pid):
+                task_store.append_event(
+                    "architecture.publish.reconciled", status="COMPLETED",
+                    payload={"project_id": pid},
+                )
+        except Exception as exc:
+            task_store.append_event(
+                "architecture.publish.reconcile_failed", status="FAILED",
+                payload={"project_id": pid, "error": str(exc)},
+            )
+        current_id = repository.current_snapshot_id(pid)
+        disk_snapshot = repository.load_snapshot(pid, current_id) if current_id else None
+        if disk_snapshot:
+            try:
+                head = run_git(project.path, "rev-parse", "HEAD")
+            except Exception:
+                head = ""
+            disk_snapshot.status = (
+                "STALE" if head and disk_snapshot.repository_revision != head else "COMPLETED"
+            )
+            task_store.upsert_architecture_snapshot(disk_snapshot)
+        for row in task_store.list_architecture_snapshots(pid):
+            metadata = Path(row.get("metadata_path") or "")
+            if row["status"] in ("COMPLETED", "STALE") and not metadata.is_file():
+                task_store.set_architecture_status(
+                    pid, row["id"], "LOST", "published metadata is missing"
+                )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Folder-watching agent runner")
     parser.add_argument(
@@ -113,6 +202,9 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    singleton = SingletonLock(DATA_ROOT / "runtime" / "watcher.lock")
+    singleton.acquire()
+
     config = load_config()
 
     if args.mode:
@@ -120,6 +212,8 @@ def main() -> None:
     os.environ["OPENCODE_URL"] = config.opencode_url
     os.environ["MAX_ATTEMPTS"] = str(config.max_attempts)
     os.environ["BACKOFF_SECONDS"] = str(config.backoff_seconds)
+    active_config_hash = config_version()
+    os.environ["RUNNER_CONFIG_HASH"] = active_config_hash
     mode = os.getenv("EXEC_MODE", "dry-run")
 
     signal.signal(signal.SIGINT, _handle_sigint)
@@ -135,6 +229,18 @@ def main() -> None:
     task_store = TaskStore()
     recovery = RecoveryManager(task_store, config)
 
+    from runtime.assets import migrate_legacy_assets
+    task_rows = task_store.list_tasks()
+    migrated = migrate_legacy_assets(
+        task_rows,
+        sorted(set(config.projects) | {str(t.get("project")) for t in task_rows if t.get("project")}),
+    )
+    if migrated:
+        logger.info(f"[assets] migrated {len(migrated)} legacy asset path(s)")
+    artifact_state = task_store.reconcile_artifacts()
+    if artifact_state["lost"]:
+        logger.warning(f"[assets] reconciliation found missing artifacts: {artifact_state}")
+
     if not args.no_recovery:
         recovered = recovery.recover_stale_tasks()
         if recovered:
@@ -142,7 +248,10 @@ def main() -> None:
         else:
             logger.info("[watcher] no stale tasks to recover")
 
-    recovery.start_heartbeat()
+    _reconcile_architecture(config, task_store)
+
+    # p10 §5: auto-generate architecture init tasks before scanning.
+    _ensure_auto_architecture_tasks(config, task_store)
 
     logger.info(f"[watcher] drop .md task files into: {PROMPTS_DIR.resolve()}")
 
@@ -151,10 +260,15 @@ def main() -> None:
         max_workers=config.max_workers,
         lock_manager=lock_manager,
         task_store=task_store,
+        heartbeat_interval=config.heartbeat_interval,
     )
 
     try:
         while _running:
+            if not args.once:
+                config, active_config_hash = _reload_safe_config(
+                    config, active_config_hash, task_store
+                )
             task = claim_task(config, task_store)
             if task:
                 paths_info = f"  allowed_paths={task.allowed_paths}" if task.allowed_paths else ""
@@ -191,9 +305,9 @@ def main() -> None:
                     pool=pool,
                 )
     finally:
-        recovery.stop_heartbeat()
         pool.shutdown()
         task_store.close()
+        singleton.release()
 
     logger.info("[watcher] stopped.")
 

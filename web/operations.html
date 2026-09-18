@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="zh"><head><meta charset="utf-8"><title>阻塞与恢复</title>
+<link rel="stylesheet" href="/static/assets/style.css">
+<script src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js" defer></script></head>
+<body><nav class="nav"><span class="brand">LangGraph + OpenCode Runner</span>
+<a href="/">总览</a><a href="/runs">需求运行</a><a href="/graph">依赖图</a>
+<a href="/tasks">任务列表</a><a href="/operations" class="active">阻塞与恢复</a></nav>
+<div class="container" x-data="ops()" x-init="load()">
+<div class="panel"><h2>Blocked Tasks</h2><template x-if="!metrics.blocked?.length"><p class="muted">当前无阻塞任务</p></template>
+<table x-show="metrics.blocked?.length"><thead><tr><th>Task</th><th>Project</th><th>原因</th><th>等待起点</th></tr></thead><tbody>
+<template x-for="t in metrics.blocked||[]" :key="t.task_id"><tr><td><a :href="'/task?id='+t.task_id" x-text="t.task_id"></a></td><td x-text="t.project"></td><td x-text="t.block_reason"></td><td x-text="t.updated_at"></td></tr></template>
+</tbody></table></div>
+<div class="panel"><h2>Active Leases</h2><template x-for="t in metrics.active_leases||[]" :key="t.task_id"><p class="small"><span class="mono" x-text="t.task_id"></span> · <span x-text="t.worker_id"></span> · lease <span class="mono" x-text="t.lease_id"></span> · <span x-text="t.heartbeat_at"></span></p></template></div>
+<div class="panel"><h2>Document Runs</h2><template x-for="r in docs" :key="r.run_id"><p><span class="mono" x-text="r.run_id"></span> · <span class="badge" :class="r.status" x-text="r.status"></span> · <span x-text="JSON.stringify(r.stats)"></span></p></template></div>
+<div class="panel"><h2>P13 Document Imports</h2>
+<template x-if="!imports.length"><p class="muted">暂无历史文档导入</p></template>
+<template x-for="r in imports" :key="r.import_run_id"><p>
+<button type="button" @click="showImport(r.import_run_id)">详情</button>
+<span class="mono" x-text="r.import_run_id"></span> ·
+<span class="badge" :class="r.status" x-text="r.status"></span> ·
+<span x-text="JSON.stringify(r.stats)"></span></p></template>
+<template x-if="selected"><div>
+<h3 x-text="selected.import_run_id"></h3>
+<p class="small">来源、文件、主张、证据、修订草稿、关系和总结均来自持久化审计数据。</p>
+<table><thead><tr><th>Source Root</th><th>Profile</th><th>Actions</th><th>Scan Error</th></tr></thead><tbody>
+<template x-for="s in selected.sources||[]" :key="s.source_root_id"><tr>
+<td class="mono" x-text="s.resolved_path"></td><td x-text="s.profile||'-'"></td>
+<td class="mono" x-text="JSON.stringify(s.actions)"></td><td x-text="s.scan_error||'-'"></td>
+</tr></template></tbody></table>
+<p class="small" x-text="'files '+(selected.items||[]).length+' · claims '+(selected.claims||[]).length+' · evidence '+(selected.evidence||[]).length+' · repairs '+(selected.repairs||[]).length+' · relations '+(selected.relations||[]).length+' · summaries '+(selected.summaries||[]).length"></p>
+</div></template></div>
+</div><script>function ops(){return{metrics:{},docs:[],imports:[],selected:null,async load(){this.metrics=await(await fetch('/api/metrics')).json();this.docs=await(await fetch('/api/document-runs')).json();this.imports=await(await fetch('/api/document-imports')).json()},async showImport(id){this.selected=await(await fetch('/api/document-imports/'+encodeURIComponent(id))).json()}}}</script></body></html>

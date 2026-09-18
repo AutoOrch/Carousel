@@ -12,10 +12,31 @@ Logs go to both stdout and ``logs/agent.log``.
 from __future__ import annotations
 
 import logging
+import re
 import sys
 from pathlib import Path
 
-LOG_DIR = Path(__file__).resolve().parent / "logs"
+from config import DATA_ROOT
+
+LOG_DIR = DATA_ROOT / "logs"
+
+
+def redact(value: str) -> str:
+    text = str(value or "")
+    for pattern, replacement in (
+        (r"(?i)(authorization\s*:\s*bearer\s+)[^\s]+", r"\1[REDACTED]"),
+        (r"(?i)((?:api[_-]?key|token|password|secret)\s*[=:]\s*)[^\s,;]+", r"\1[REDACTED]"),
+        (r"\b(?:sk|ghp|github_pat)_[A-Za-z0-9_-]{12,}\b", "[REDACTED]"),
+    ):
+        text = re.sub(pattern, replacement, text)
+    return text
+
+
+class _RedactingFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.msg = redact(record.getMessage())
+        record.args = ()
+        return True
 
 
 def setup_logging(level: str = "INFO") -> None:
@@ -29,11 +50,13 @@ def setup_logging(level: str = "INFO") -> None:
 
     console = logging.StreamHandler(sys.stdout)
     console.setFormatter(formatter)
+    console.addFilter(_RedactingFilter())
 
     file_handler = logging.FileHandler(
         LOG_DIR / "agent.log", encoding="utf-8"
     )
     file_handler.setFormatter(formatter)
+    file_handler.addFilter(_RedactingFilter())
 
     root = logging.getLogger("agent")
     root.setLevel(level)

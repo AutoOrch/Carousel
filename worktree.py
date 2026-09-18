@@ -132,7 +132,10 @@ def merge_branch(
 
     Returns ``{"success": bool, "conflict": bool, "output": str}``.
     """
-    args = ["git", "merge", "--no-ff"]
+    # Keep the merge uncommitted until the runner's deterministic integration
+    # gate passes.  This makes clean and conflict-resolved paths obey the same
+    # validation policy and lets a failed gate abort without publishing code.
+    args = ["git", "merge", "--no-ff", "--no-commit"]
     if message:
         args += ["-m", message]
     args.append(branch)

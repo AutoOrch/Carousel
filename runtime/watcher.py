@@ -39,17 +39,23 @@ def claim_task(config: Config, task_store: TaskStore) -> Task | None:
             _move_to_failed(target)
             continue
 
-        task_store.create_task(
+        accepted = task_store.create_task(
             task_id=task.id,
             prompt_file=str(target),
             project=task.project,
             run_id=task.run_id,
         )
+        if not accepted:
+            logger.error(f"[watcher] reject duplicate completed task id: {task.id}")
+            _move_to_failed(target)
+            continue
         if task.run_id:
             # First claim of this run's tasks moves it out of PLANNED.
             # Requeueing a task of a FAILED / NEEDS_REPLAN run re-opens it.
             run = task_store.get_run(task.run_id)
-            if run and run["status"] in ("PLANNED", "FAILED", "NEEDS_REPLAN"):
+            if run and run["status"] in (
+                "PLANNED", "PLANNING", "QUEUED", "FAILED", "NEEDS_REPLAN"
+            ):
                 task_store.update_run(task.run_id, status="EXECUTING")
         return task
     return None

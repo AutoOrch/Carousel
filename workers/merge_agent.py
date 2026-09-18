@@ -45,6 +45,8 @@ def run_merge_agent(
     model: str,
     mode: str = "dry-run",
     opencode_url: str = "http://127.0.0.1:4096",
+    attempt_id: str = "",
+    run_id: str = "",
 ) -> bool:
     """Resolve merge conflicts. Returns True if resolved successfully."""
     conflicts = list_conflicted_files(project_path)
@@ -54,7 +56,7 @@ def run_merge_agent(
     )
 
     if mode == "dry-run":
-        return _resolve_dry_run(task_id, project_path, test_command)
+        return _resolve_dry_run(task_id, project_path, test_command, attempt_id, run_id)
 
     return _resolve_opencode(
         task_id,
@@ -66,10 +68,15 @@ def run_merge_agent(
         model,
         conflicts,
         opencode_url,
+        attempt_id,
+        run_id,
     )
 
 
-def _resolve_dry_run(task_id: str, repo: Path, test_command: str) -> bool:
+def _resolve_dry_run(
+    task_id: str, repo: Path, test_command: str,
+    attempt_id: str = "", run_id: str = "",
+) -> bool:
     """Auto-resolve conflicts by keeping both sides (dry-run simulation)."""
     conflicts = list_conflicted_files(repo)
     for filepath in conflicts:
@@ -86,12 +93,23 @@ def _resolve_dry_run(task_id: str, repo: Path, test_command: str) -> bool:
         logger.info(f"[{task_id}] Merge Agent: still has unmerged paths")
         return False
 
-    commit_merge(repo, f"merge-agent: {task_id}")
-
     if test_command:
         logger.info(f"[{task_id}] Merge Agent: running tests: {test_command}")
+        result = subprocess.run(
+            test_command, shell=True, cwd=str(repo), capture_output=True,
+            text=True, encoding="utf-8", errors="replace", timeout=1800,
+        )
+        if result.returncode != 0:
+            logger.info(
+                f"[{task_id}] Merge Agent: tests failed\n{result.stdout}\n{result.stderr}"
+            )
+            return False
     else:
         logger.info(f"[{task_id}] Merge Agent: no test command, skipping tests")
+    commit_merge(
+        repo, f"merge-agent: {task_id}\n\nTask-ID: {task_id}\n"
+        f"Attempt-ID: {attempt_id}\nRun-ID: {run_id or '-'}"
+    )
     return True
 
 
@@ -105,6 +123,8 @@ def _resolve_opencode(
     model: str,
     conflicts: list[str],
     opencode_url: str,
+    attempt_id: str = "",
+    run_id: str = "",
 ) -> bool:
     prompt = MERGE_PROMPT_TEMPLATE.format(
         base_branch=base_branch,
@@ -126,10 +146,6 @@ def _resolve_opencode(
             logger.info(f"[{task_id}] Merge Agent: OpenCode left unmerged paths")
             return False
 
-        status = run_git(repo, "status", "--porcelain")
-        if status.strip():
-            commit_merge(repo, f"merge-agent: {task_id}")
-
         if test_command:
             result = subprocess.run(
                 test_command,
@@ -143,6 +159,13 @@ def _resolve_opencode(
             if result.returncode != 0:
                 logger.info(f"[{task_id}] Merge Agent: tests failed\n{result.stdout}\n{result.stderr}")
                 return False
+
+        status = run_git(repo, "status", "--porcelain")
+        if status.strip():
+            commit_merge(
+                repo, f"merge-agent: {task_id}\n\nTask-ID: {task_id}\n"
+                f"Attempt-ID: {attempt_id}\nRun-ID: {run_id or '-'}"
+            )
 
         return True
     finally:

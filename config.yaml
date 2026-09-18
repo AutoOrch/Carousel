@@ -1,6 +1,12 @@
 # Agent runner configuration
 # One task file (prompts/*.md) declares `project: <id>` in its front matter;
 # the resolver maps that id to a real repository path here.
+#
+# Runtime data root — all working directories (prompts, processing, projects,
+# logs, runtime/tasks.db, doc inbox) live here, separated from source code.
+# Relative paths resolve against the runner install dir.  Override at runtime
+# with the RUNNER_DATA_ROOT environment variable.
+data_root: ../runner-data
 
 projects:
 
@@ -8,6 +14,8 @@ projects:
     path: ./demo-repo
     default_branch: master
     language: markdown
+    # Document pipeline keywords (p11 §5) — rule-based project identification
+    keywords: [demo, 演示]
     test:
       command: ""
     opencode:
@@ -18,6 +26,7 @@ projects:
     path: ./demo-repo-2
     default_branch: master
     language: markdown
+    keywords: [demo2]
     test:
       command: ""
     opencode:
@@ -61,6 +70,18 @@ recovery:
 opencode:
   base_url: http://127.0.0.1:4096
 
+# Architecture assets (p10) — control-plane data owned by the runner.
+architecture:
+  default_snapshot: baseline
+  archify_command: node
+  # Points at the locally installed archify skill by default; override for
+  # another installation (e.g. D:/Tools/archify/bin/archify.mjs).
+  # archify_entry: D:/Tools/archify/bin/archify.mjs
+  validation:
+    enabled: true
+  rendering:
+    enabled: true
+
 final_review:
   enabled: true          # watcher --once 完成后自动触发最终需求审查
   auto_replan: true      # PARTIAL/FAILED 时自动生成补充任务
@@ -69,3 +90,35 @@ final_review:
   fail_on_high_risk: true
   reviewer_agent: plan
   reviewer_model: ""
+
+# Document pipeline (p11) — drop files into doc/, they get classified,
+# deduplicated (SHA256 vs MANIFEST.json), archived under
+# projects/<stable-project-id>/documents/
+# and listed in a per-project INDEX.md.  Low-confidence docs go to
+# doc/review/ for human confirmation instead of being archived.
+documents:
+  input_dir: ./doc
+  confidence_threshold: 0.8
+  max_workers: 4
+  content_preview_chars: 4000
+  imports:
+    defaults:
+      recursive: true
+      copy_source: true
+      actions:
+        validate: false
+        repair: false
+        consolidate: false
+        merge: false
+      repair_mode: annotate
+      review_required: true
+    profiles:
+      historical-implementation:
+        actions: { validate: true, repair: true, consolidate: true, merge: true }
+        repair_mode: rewrite-draft
+      historical-requirements:
+        actions: { validate: true, repair: false, consolidate: true, merge: false }
+    exclude_dirs: [.git, .venv, node_modules, vendor, dist, build, __pycache__]
+    max_files: 10000
+    max_file_bytes: 52428800
+    max_total_bytes: 2147483648

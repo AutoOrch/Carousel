@@ -15,6 +15,8 @@ def _normalize_path(p: str) -> str:
 def _paths_conflict(a: str, b: str) -> bool:
     na = _normalize_path(a)
     nb = _normalize_path(b)
+    if na in ("", "*", "**") or nb in ("", "*", "**"):
+        return True
     if na == nb:
         return True
     for p1, p2 in ((na, nb), (nb, na)):
@@ -38,25 +40,24 @@ class FileLockManager:
         self._guard = threading.Lock()
 
     def acquire(self, task: Task) -> bool:
-        paths = task.allowed_paths
-        if not paths:
-            return True
+        paths = task.allowed_paths or ["**"]
 
         with self._guard:
             for p in paths:
                 for held, holder in self._locks.items():
-                    if holder != task.id and _paths_conflict(p, held):
+                    held_project, held_path = held.split("::", 1)
+                    if (held_project == task.project.lower()
+                            and holder != task.id
+                            and _paths_conflict(p, held_path)):
                         return False
             for p in paths:
-                self._locks[_normalize_path(p)] = task.id
+                self._locks[f"{task.project.lower()}::{_normalize_path(p)}"] = task.id
             return True
 
     def release(self, task: Task) -> None:
-        paths = task.allowed_paths
-        if not paths:
-            return
+        paths = task.allowed_paths or ["**"]
         with self._guard:
             for p in paths:
-                key = _normalize_path(p)
+                key = f"{task.project.lower()}::{_normalize_path(p)}"
                 if self._locks.get(key) == task.id:
                     del self._locks[key]

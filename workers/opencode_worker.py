@@ -79,15 +79,17 @@ def run_opencode(
     client = OpenCodeClient(base_url=opencode_url)
     session = client.create_session(title=task.title, directory=str(worktree))
     session_id = session["id"]
-    response = client.send_message(
-        session_id,
-        full_prompt,
-        model=task.model or None,
-        agent=task.agent or None,
-    )
-    diff = client.get_diff(session_id)
-    client.delete_session(session_id)
-    logger.info(f"[{task.id}] OpenCode session {session_id} cleaned up")
+    try:
+        response = client.send_message(
+            session_id,
+            full_prompt,
+            model=task.model or None,
+            agent=task.agent or None,
+        )
+        diff = client.get_diff(session_id)
+    finally:
+        client.delete_session(session_id)
+        logger.info(f"[{task.id}] OpenCode session {session_id} cleaned up")
     return {
         "session_id": session_id,
         "response": response,

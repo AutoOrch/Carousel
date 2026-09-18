@@ -2,7 +2,7 @@
 <html lang="zh">
 <head>
 <meta charset="utf-8">
-<title>依赖图</title>
+<title>Graph</title>
 <link rel="stylesheet" href="/static/assets/style.css">
 <script src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js" defer></script>
 <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
@@ -11,41 +11,103 @@
 <nav class="nav">
   <span class="brand">LangGraph + OpenCode Runner</span>
   <a href="/">总览</a>
+  <a href="/runs">需求运行</a>
   <a href="/graph" class="active">依赖图</a>
-  <a href="/tasks">任务列表</a>
+  <a href="/tasks">任务列表</a><a href="/operations">阻塞与恢复</a>
 </nav>
 
 <div class="container" x-data="graph()">
   <div class="panel">
-    <h2>任务依赖 DAG</h2>
-    <p class="small muted">
-      <span class="dot" style="background:var(--green)"></span>COMPLETED
-      <span class="dot" style="background:var(--blue)"></span>RUNNING
-      <span class="dot" style="background:var(--gray)"></span>PENDING / UNKNOWN
-      <span class="dot" style="background:var(--red)"></span>FAILED
-      　·　虚线边框 = 跨项目任务　·　红色虚线边 = 依赖缺失
-    </p>
-    <div id="mermaid-wrap" style="overflow-x:auto">
+    <h2>Graph</h2>
+    <div class="filter-bar">
+      <select x-model="view">
+        <option value="task">任务依赖图</option>
+        <option value="architecture">项目架构图</option>
+      </select>
+      <select x-model="project" x-show="view === 'architecture'" @change="onProjectChange()">
+        <option value="">选择项目…</option>
+        <template x-for="p in archProjects" :key="p">
+          <option :value="p" x-text="p"></option>
+        </template>
+      </select>
+      <select x-model="snapshot" x-show="view === 'architecture' && snapshots.length > 0" @change="onSnapshotChange()">
+        <option value="baseline">baseline</option>
+        <template x-for="s in snapshots" :key="s.snapshot_id">
+          <option :value="s.snapshot_id" x-text="s.snapshot_id + ' (' + s.revision + ')'"></option>
+        </template>
+      </select>
+      <span class="muted small" style="align-self:center"
+            x-show="view === 'task'"
+            x-text="'状态: ● COMPLETED ● RUNNING ● PENDING/UNKNOWN ● FAILED · 虚线框 = 跨项目 · 红虚线 = 依赖缺失'"></span>
+    </div>
+  </div>
+
+  <!-- 任务依赖图视图 -->
+  <div class="panel" x-show="view === 'task'">
+    <div style="overflow-x:auto">
       <pre class="mermaid" x-html="mermaidSrc"></pre>
     </div>
     <p class="muted small" x-show="!loaded">加载中…</p>
     <p class="muted small" x-show="loaded && nodes.length === 0">暂无任务</p>
+  </div>
+
+  <!-- 项目架构图视图 -->
+  <div class="panel" x-show="view === 'architecture'">
+    <template x-if="!project">
+      <p class="muted">选择一个项目以查看其架构图（由 ARCHITECTURE_INIT 任务生成并持久化）。</p>
+    </template>
+    <template x-if="project && !archInfo.available">
+      <p class="muted">项目 <span class="mono" x-text="project"></span> 尚无架构基线。
+        运行 <code class="mono">python architecture_init.py --project <span x-text="project"></span></code>
+        并执行 watcher 生成。</p>
+    </template>
+    <template x-if="project && archInfo.available">
+      <div>
+        <div class="small muted" style="margin-bottom:10px">
+          revision <span class="mono" x-text="archInfo.revision"></span>
+          · snapshot <span class="mono" x-text="archInfo.latest_snapshot"></span>
+          · <span x-text="archInfo.status"></span>
+          <a :href="archInfo.json_url" target="_blank" style="margin-left:10px">查看 JSON</a>
+        </div>
+        <div x-show="archInfo.stale" class="small"
+             style="margin-bottom:10px; color: var(--amber);">
+          ⚠ 架构图可能不是当前代码版本（快照 <span class="mono" x-text="archInfo.revision"></span>
+          · 当前 <span class="mono" x-text="archInfo.current_revision"></span>）—
+          重新运行 architecture_init.py 刷新基线
+        </div>
+        <iframe
+          :src="archInfo.html_url"
+          sandbox="allow-scripts"
+          style="width:100%; height:800px; border:0; border-radius:8px; background:#fff;">
+        </iframe>
+      </div>
+    </template>
   </div>
 </div>
 
 <script>
 function graph() {
   return {
+    view: 'task',
+    project: '',
+    snapshot: 'baseline',
+    archProjects: [],
+    snapshots: [],
+    archInfo: { available: false },
     nodes: [],
     edges: [],
     loaded: false,
     mermaidSrc: '',
+
     async init() {
-      await this.refresh();
+      await this.refreshTaskGraph();
+      await this.refreshArchitectures();
       const es = new EventSource('/api/events/stream');
-      es.onmessage = () => this.refresh();
+      es.onmessage = () => { this.refreshTaskGraph(); this.refreshArchitectures(); };
     },
-    async refresh() {
+
+    async refreshTaskGraph() {
+      if (this.view !== 'task') return;
       try {
         const r = await fetch('/api/graph');
         const d = await r.json();
@@ -55,6 +117,52 @@ function graph() {
         this.loaded = true;
       } catch (e) { console.error(e); }
     },
+
+    async refreshArchitectures() {
+      try {
+        const r = await fetch('/api/architectures');
+        const d = await r.json();
+        this.archProjects = d.filter(x => x.available).map(x => x.project_id);
+        if (this.project && this.archProjects.includes(this.project)) {
+          await this.loadProjectArch(this.project);
+        } else if (this.project && !this.archProjects.includes(this.project)) {
+          this.archInfo = { available: false };
+        }
+      } catch (e) { console.error(e); }
+    },
+
+    async onProjectChange() {
+      this.snapshot = 'baseline';
+      this.snapshots = [];
+      if (this.project) await this.loadProjectArch(this.project);
+    },
+
+    async onSnapshotChange() {
+      if (this.project && this.snapshot) await this.loadProjectArch(this.project, this.snapshot);
+    },
+
+    async loadProjectArch(pid, snap) {
+      try {
+        const r = await fetch('/api/architectures/' + encodeURIComponent(pid));
+        const d = await r.json();
+        this.snapshots = d.snapshots || [];
+        if (!snap) snap = d.latest ? d.latest.snapshot_id : 'baseline';
+        // point at the requested snapshot
+        if (d.available && d.latest) {
+          this.archInfo = {
+            available: true,
+            status: d.latest.status,
+            latest_snapshot: snap,
+            revision: (this.snapshots.find(s => s.snapshot_id === snap) || {}).revision || d.latest.revision,
+            html_url: `/api/architectures/${encodeURIComponent(pid)}/${encodeURIComponent(snap)}/html`,
+            json_url: `/api/architectures/${encodeURIComponent(pid)}/${encodeURIComponent(snap)}/json`,
+          };
+        } else {
+          this.archInfo = { available: false };
+        }
+      } catch (e) { console.error(e); }
+    },
+
     render() {
       if (this.nodes.length === 0) { this.mermaidSrc = ''; return; }
       const fill = {

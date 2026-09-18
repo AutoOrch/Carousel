@@ -22,6 +22,7 @@ from log import get_logger
 from opencode_client import OpenCodeClient
 from requirement_run import load_plan, load_requirement
 from runtime.task_store import TaskStore
+from runtime.assets import run_reports_dir, task_report_path
 from schemas.requirement_review import (
     FollowupTask,
     RequirementReview,
@@ -239,6 +240,13 @@ class RequirementClosure:
             # trigger instead of being stuck in FINAL_REVIEWING forever.
             self._store.update_run(run_id, status="EXECUTING")
             raise
+        hard_failures = context.get("hard_gate_failures") or []
+        if hard_failures:
+            review.status = "FAILED"
+            review.summary = (
+                "Deterministic gates failed:\n- " + "\n- ".join(hard_failures)
+                + "\n\n" + (review.summary or "")
+            )
         review.base_revision = context["base_revision"]
         review.final_revision = context["final_revision"]
 
@@ -255,6 +263,14 @@ class RequirementClosure:
             followup_generated=bool(review.followup_tasks),
             base_revision=review.base_revision,
             final_revision=review.final_revision,
+        )
+        review_id = f"{run_id}-r{round_}"
+        self._store.record_review_items(review_id, review.requirements, review.risks)
+        self._store.register_artifact(
+            "FINAL_REVIEW_MARKDOWN", str(report_path), run_id=run_id
+        )
+        self._store.register_artifact(
+            "FINAL_REVIEW_JSON", str(json_path), run_id=run_id
         )
 
         self._store.update_run(
@@ -282,14 +298,17 @@ class RequirementClosure:
                     f"queued (round {round_ + 1}/{self._config.final_review.max_rounds})"
                 )
             else:
-                self._store.update_run(run_id, status="NEEDS_REPLAN")
+                self._store.update_run(run_id, status="NEEDS_ACTION")
                 logger.warning(
                     f"[closure] {run_id}: {review.status} but no usable follow-up tasks; "
                     "run needs manual attention"
                 )
         else:
-            final_status = "COMPLETED" if review.status in ("COMPLETE", "RISK_ACCEPTED") else (
-                "FAILED" if review.status == "FAILED" else "NEEDS_REPLAN"
+            final_status = (
+                "COMPLETED" if review.status == "COMPLETE"
+                else "NEEDS_ACTION" if review.status == "RISK_ACCEPTED"
+                else "FAILED" if review.status == "FAILED"
+                else "NEEDS_ACTION"
             )
             self._store.update_run(run_id, status=final_status)
             logger.info(f"[closure] {run_id} closed as {final_status}")
@@ -327,7 +346,9 @@ class RequirementClosure:
                 "attempt": t["attempt"],
                 "commit": (t.get("commit_sha") or "")[:12],
             }
-            report_path = REPORTS_DIR / f"{t['task_id']}.md"
+            report_path = task_report_path(t["project"], t["task_id"])
+            if not report_path.exists():
+                report_path = REPORTS_DIR / f"{t['task_id']}.md"  # legacy fallback
             if report_path.exists():
                 text = report_path.read_text(encoding="utf-8-sig", errors="replace")
                 claimed[t["task_id"]] = _extract_changed_files_from_report(text)
@@ -350,6 +371,7 @@ class RequirementClosure:
             if not base:
                 base = _run_git(repo, "rev-parse", "HEAD")
             final = _run_git(repo, "rev-parse", "HEAD")
+            self._store.update_run_project_final(run_id, p["id"], final)
             if not base_revision:
                 base_revision, final_revision = base, final
             log = _run_git(repo, "log", "--oneline", f"{base}..HEAD") if base else "(no base)"
@@ -385,6 +407,10 @@ class RequirementClosure:
         # Final tests: only meaningful for real (opencode) runs; config-
         # registered projects only — ad-hoc path projects have no test command.
         test_sections: list[str] = []
+        hard_gate_failures: list[str] = [
+            f"task {t['task_id']} ended as {t['status']}"
+            for t in tasks if t["status"] != "COMPLETED"
+        ]
         for p in projects:
             project = self._config.projects.get(p["id"]) or next(
                 (x for x in self._config.projects.values()
@@ -412,12 +438,17 @@ class RequirementClosure:
                 test_sections.append(
                     f"### {p['id']}: `{project.test_command}` → TIMEOUT after 1800s"
                 )
+                hard_gate_failures.append(f"{p['id']}: final test timed out")
                 continue
             output = (result.stdout + "\n" + result.stderr).strip()[:4000]
             test_sections.append(
                 f"### {p['id']}: `{project.test_command}` → "
                 f"exit={result.returncode}\n```\n{output}\n```"
             )
+            if result.returncode != 0:
+                hard_gate_failures.append(
+                    f"{p['id']}: final test failed with exit {result.returncode}"
+                )
 
         return {
             "run": run or {},
@@ -429,6 +460,7 @@ class RequirementClosure:
             "git_sections": git_sections,
             "claimed_vs_actual": claimed_vs_actual,
             "test_sections": test_sections,
+            "hard_gate_failures": hard_gate_failures,
             "base_revision": base_revision,
             "final_revision": final_revision,
         }
@@ -602,9 +634,10 @@ class RequirementClosure:
     # --------------------------------------------------------------- output
 
     def _write_reports(self, run_id: str, round_: int, review: RequirementReview) -> tuple[Path, Path]:
-        REPORTS_DIR.mkdir(parents=True, exist_ok=True)
-        json_path = REPORTS_DIR / f"{run_id}-final-review-r{round_}.json"
-        md_path = REPORTS_DIR / f"{run_id}-final-review-r{round_}.md"
+        output_dir = run_reports_dir()
+        output_dir.mkdir(parents=True, exist_ok=True)
+        json_path = output_dir / f"{run_id}-final-review-r{round_}.json"
+        md_path = output_dir / f"{run_id}-final-review-r{round_}.md"
 
         json_path.write_text(
             json.dumps(review.to_dict(), ensure_ascii=False, indent=2),
@@ -657,7 +690,10 @@ class RequirementClosure:
 
     def _should_replan(self, review: RequirementReview, round_: int) -> bool:
         fr = self._config.final_review
-        if review.status in ("COMPLETE", "RISK_ACCEPTED"):
+        if review.status == "RISK_ACCEPTED":
+            logger.warning("[closure] RISK_ACCEPTED requires human acknowledgement")
+            return False
+        if review.status == "COMPLETE":
             # fail_on_high_risk: a high risk downgrades a COMPLETE verdict.
             if (fr.fail_on_high_risk and review.status == "COMPLETE"
                     and any(k.severity == "high" for k in review.risks)):
@@ -682,7 +718,7 @@ class RequirementClosure:
         if not review.followup_tasks:
             return []
         primary_ref = (context["projects"] or [{}])[0].get("ref", "")
-        from planner import write_tasks  # reuse numbering + front-matter
+        from planner import validate_plan, write_tasks  # reuse numbering + front-matter
 
         task_dicts = []
         for t in review.followup_tasks:
@@ -694,8 +730,23 @@ class RequirementClosure:
                 "prompt": prompt,
                 "allowed_paths": t.allowed_paths,
                 "depends_on": t.depends_on,
+                "requirement_ids": t.requirement_ids,
+                "reason": t.reason,
             })
-        return write_tasks(task_dicts, primary_ref, run_id=run_id)
+        refs = {str(p.get("ref") or "") for p in context["projects"]}
+        existing_ids = {str(t.get("task_id") or "") for t in context["tasks"]}
+        validate_plan(
+            task_dicts, allowed_projects=refs,
+            allowed_dependency_ids=existing_ids,
+        )
+        written = write_tasks(task_dicts, primary_ref, run_id=run_id)
+        from requirement_run import save_plan_tasks
+        next_round = self._store.get_review_count(run_id) + 1
+        save_plan_tasks(
+            run_id, task_dicts, task_store=self._store, round_=next_round,
+            source_review_id=f"{run_id}-r{next_round - 1}",
+        )
+        return written
 
 
 def _compose_followup_prompt(t: FollowupTask) -> str:
