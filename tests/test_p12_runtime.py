@@ -568,6 +568,128 @@ class OpenCodeAsyncClientTests(unittest.TestCase):
             _validate_raw_config({"opencode": {"timeout": "forever"}})
 
 
+class ResumeAfterFailureTests(unittest.TestCase):
+    """A terminal failure preserves the work; a requeue resumes it."""
+
+    def _invoke(self, root: Path, task: Task, run_opencode=None, max_attempts="1"):
+        env = {"EXEC_MODE": "dry-run", "MAX_ATTEMPTS": max_attempts,
+               "BACKOFF_SECONDS": "0"}
+        patches = [
+            patch.dict(os.environ, env),
+            patch.object(task_graph, "PROCESSED_DIR", root / "processed"),
+            patch.object(task_graph, "FAILED_DIR", root / "failed"),
+            patch.object(task_graph, "task_report_path", lambda p, t: root / "reports" / f"{t}.md"),
+            patch.object(task_graph, "worktree_path", lambda p, t: root / "worktrees" / p / t),
+        ]
+        if run_opencode is not None:
+            patches.append(patch.object(task_graph, "run_opencode", run_opencode))
+        with ExitStack() as stack:
+            for item in patches:
+                stack.enter_context(item)
+            task_graph.set_task_store(None)
+            return task_graph.build_task_graph().invoke(
+                {"task": task}, {"configurable": {"thread_id": task.id}}
+            )
+
+    @staticmethod
+    def _task(root: Path, name: str, **kwargs) -> Task:
+        prompt = root / "processing" / f"{name}.md"
+        prompt.parent.mkdir(parents=True, exist_ok=True)
+        prompt.write_text(f"# {name}", encoding="utf-8")
+        return Task(name, prompt, "demo", root / "repo", "main", name, **kwargs)
+
+    def test_failure_preserves_wip_and_requeue_resumes(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            init_repo(root)
+            task = self._task(root, "resumable")
+
+            def failing(task, worktree, **kwargs):
+                (Path(worktree) / "wip.txt").write_text("half done", encoding="utf-8")
+                raise RuntimeError("agent crashed mid-run")
+
+            self._invoke(root, task, run_opencode=failing)
+
+            # Terminal failure: file in failed/, worktree dir gone, branch kept.
+            self.assertTrue((root / "failed" / "resumable.md").exists())
+            worktree_dir = root / "worktrees" / "demo" / "resumable"
+            self.assertFalse(worktree_dir.exists())
+            repo = root / "repo"
+            branches = subprocess.run(["git", "branch", "--list", "agent/resumable"],
+                                      cwd=repo, capture_output=True, text=True).stdout
+            self.assertIn("agent/resumable", branches)
+            # WIP survived on the branch
+            blob = subprocess.run(
+                ["git", "show", "agent/resumable:wip.txt"],
+                cwd=repo, capture_output=True, text=True).stdout
+            self.assertEqual("half done", blob)
+
+            # Requeue: same task file, agent succeeds this time.
+            requeued = self._task(root, "resumable")
+            captured = {}
+
+            def succeeding(task, worktree, **kwargs):
+                captured["replan_context"] = kwargs.get("replan_context", "")
+                self.assertTrue((Path(worktree) / "wip.txt").exists())  # resumed!
+                (Path(worktree) / "feature.txt").write_text("done", encoding="utf-8")
+                return {"response": {"message": "## STATUS\nSUCCESS"}}
+
+            result = self._invoke(root, requeued, run_opencode=succeeding,
+                                  max_attempts="2")
+            self.assertEqual("", result["error"])
+            # Prior work + new work merged into main
+            self.assertEqual("half done", (repo / "wip.txt").read_text(encoding="utf-8"))
+            self.assertEqual("done", (repo / "feature.txt").read_text(encoding="utf-8"))
+            self.assertTrue((root / "processed" / "resumable.md").exists())
+            # Branch merged and cleaned up after success
+            branches = subprocess.run(["git", "branch", "--list", "agent/resumable"],
+                                      cwd=repo, capture_output=True, text=True).stdout
+            self.assertEqual("", branches.strip())
+
+    def test_resume_false_starts_clean(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            init_repo(root)
+            task = self._task(root, "freshstart")
+
+            def failing(task, worktree, **kwargs):
+                (Path(worktree) / "wip.txt").write_text("half done", encoding="utf-8")
+                raise RuntimeError("boom")
+
+            self._invoke(root, task, run_opencode=failing)
+            repo = root / "repo"
+            self.assertIn("agent/freshstart", subprocess.run(
+                ["git", "branch", "--list", "agent/freshstart"],
+                cwd=repo, capture_output=True, text=True).stdout)
+
+            requeued = self._task(root, "freshstart", resume=False)
+
+            def succeeding(task, worktree, **kwargs):
+                self.assertFalse((Path(worktree) / "wip.txt").exists())  # clean slate
+                (Path(worktree) / "feature.txt").write_text("done", encoding="utf-8")
+                return {"response": {"message": "## STATUS\nSUCCESS"}}
+
+            result = self._invoke(root, requeued, run_opencode=succeeding,
+                                  max_attempts="2")
+            self.assertEqual("", result["error"])
+            self.assertFalse((repo / "wip.txt").exists())
+            self.assertEqual("done", (repo / "feature.txt").read_text(encoding="utf-8"))
+
+    def test_pool_injects_prior_failure_context(self) -> None:
+        from runtime.worker_pool import _prior_failure_context
+        self.assertEqual("", _prior_failure_context(None, None))
+        self.assertEqual("", _prior_failure_context({"failure_type": ""}, None))
+        context = _prior_failure_context(
+            {"failure_type": "EXECUTION_ERROR", "failure_message": "read timeout",
+             "attempt": 3}, None
+        )
+        self.assertIn("PREVIOUS_RUN_FAILURE", context)
+        self.assertIn("EXECUTION_ERROR", context)
+        self.assertIn("read timeout", context)
+        self.assertIn("3 attempt(s)", context)
+        self.assertIn("Do not redo work", context)
+
+
 class AssetSafetyTests(unittest.TestCase):
     def test_architecture_staging_keeps_current_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as raw:

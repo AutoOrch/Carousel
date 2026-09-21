@@ -20,10 +20,13 @@ from workers.merge_agent import run_merge_agent
 from workers.opencode_worker import run_opencode
 from worktree import (
     abort_merge,
+    attach_worktree,
+    branch_exists,
     commit_worktree,
     create_worktree,
     get_project_lock,
     merge_branch,
+    remove_worktree,
     reset_worktree,
     run_git,
 )
@@ -260,6 +263,35 @@ def _cleanup_task(task: Task, worktree_path: str) -> None:
         logger.warning(f"[{task.id}] worktree cleanup failed: {exc}")
 
 
+def _preserve_task_work(task: Task, worktree_path: str, attempt: int) -> None:
+    """Keep a failed task's work for a resumable requeue.
+
+    Commits any uncommitted WIP onto the agent branch, then removes only
+    the checkout — the branch and its commits survive, so requeueing the
+    task file resumes from the preserved work instead of redoing it from
+    scratch (see prepare's resume path).
+    """
+    if not worktree_path or task.type == TASK_TYPE_ARCHITECTURE_INIT:
+        return
+    worktree = Path(worktree_path)
+    if not worktree.is_dir():
+        return  # nothing was produced — the branch (if any) is already safe
+    repo = task.project_path
+    branch = f"agent/{task.id}"
+    try:
+        commit_worktree(
+            worktree,
+            f"wip: attempt {attempt} failed — work preserved for resume\n\nTask-ID: {task.id}",
+        )
+    except Exception as exc:
+        logger.warning(f"[{task.id}] WIP commit before preserve failed: {exc}")
+    try:
+        remove_worktree(repo, worktree)
+        logger.info(f"[{task.id}] worktree removed; branch {branch} preserved for resume")
+    except Exception as exc:
+        logger.warning(f"[{task.id}] worktree removal failed (branch kept): {exc}")
+
+
 # ---------------------------------------------------------------------------
 # Nodes
 # ---------------------------------------------------------------------------
@@ -336,16 +368,7 @@ def prepare(state: TaskState) -> dict[str, Any]:
             )
 
     try:
-        if attempt == 0 and not worktree.exists():
-            reset_worktree(repo, worktree, branch)
-            create_worktree(repo, worktree, branch, base_ref=task.base_branch)
-            logger.info(f"[{task.id}] worktree created: {worktree}")
-        elif worktree.exists() and _is_valid_worktree(repo, worktree, branch):
-            logger.info(f"[{task.id}] reusing existing worktree (attempt={attempt})")
-        else:
-            logger.info(f"[{task.id}] worktree stale, recreating")
-            reset_worktree(repo, worktree, branch)
-            create_worktree(repo, worktree, branch, base_ref=task.base_branch)
+        _setup_worktree(state, task, repo, worktree, branch, attempt)
     except Exception as exc:
         # Best-effort cleanup of a half-created worktree so nothing leaks.
         try:
@@ -358,6 +381,56 @@ def prepare(state: TaskState) -> dict[str, Any]:
         )
 
     return {"worktree": str(worktree)}
+
+
+def _setup_worktree(
+    state: TaskState, task: Task, repo: Path, worktree: Path, branch: str, attempt: int
+) -> None:
+    """Create/reuse the task worktree, resuming from preserved WIP if any.
+
+    A terminal failure preserves the agent branch (see _preserve_task_work);
+    when the task file is requeued, that branch is checked out again so the
+    agent continues the previous work.  ``resume: false`` in the front matter
+    discards the branch and starts clean.
+    """
+    if worktree.exists() and _is_valid_worktree(repo, worktree, branch):
+        logger.info(f"[{task.id}] reusing existing worktree (attempt={attempt})")
+        return
+
+    preserved = branch_exists(repo, branch)
+    if task.resume and preserved:
+        if worktree.exists():
+            # Stale unregistered directory — drop it, the branch is the source of truth.
+            remove_worktree(repo, worktree)
+        attach_worktree(repo, worktree, branch)
+        ahead = _commits_ahead(repo, task.base_branch, branch)
+        logger.info(
+            f"[{task.id}] RESUMING from preserved branch {branch} "
+            f"({ahead} commit(s) ahead of {task.base_branch})"
+        )
+        _report(
+            state, "Prepare — resumed prior work",
+            "agent branch: {b}\ncommits ahead of {base}: {n}\n"
+            "The previous run failed; continue the preserved work, fix the "
+            "reported failure, and do not redo completed work.".format(
+                b=branch, base=task.base_branch, n=ahead,
+            ),
+        )
+        return
+
+    logger.info(
+        f"[{task.id}] worktree created: {worktree}"
+        + ("" if not preserved else " (resume disabled — starting clean)")
+    )
+    reset_worktree(repo, worktree, branch)
+    create_worktree(repo, worktree, branch, base_ref=task.base_branch)
+
+
+def _commits_ahead(repo: Path, base_branch: str, branch: str) -> int:
+    try:
+        return int(run_git(repo, "rev-list", "--count", f"{base_branch}..{branch}").strip() or 0)
+    except Exception:
+        return 0
 
 
 def execute(state: TaskState) -> dict[str, Any]:
@@ -1005,13 +1078,16 @@ def finalize_success(state: TaskState) -> dict[str, Any]:
 
 def finalize_failed(state: TaskState) -> dict[str, Any]:
     task: Task = state["task"]
+    attempt = state.get("attempt", 1)
     _checkpoint(state, "failed")
     try:
         abort_merge(task.project_path)
     except Exception:
         pass
     _restore_base_stash(state)
-    _cleanup_task(task, state.get("worktree", ""))
+    # Preserve the agent branch (with a WIP commit) so a requeue of this
+    # task file resumes the work instead of redoing it from scratch.
+    _preserve_task_work(task, state.get("worktree", ""), attempt)
     _move_task_file(task, FAILED_DIR)
 
     if _task_store:
@@ -1023,12 +1099,17 @@ def finalize_failed(state: TaskState) -> dict[str, Any]:
         or state.get("failure_type")
         or "max attempts exceeded"
     )
-    attempt = state.get("attempt", 1)
-    logger.info(f"[{task.id}] FAILED -> failed/ (attempt={attempt}, reason={reason})")
+    logger.info(
+        f"[{task.id}] FAILED -> failed/ (attempt={attempt}, reason={reason}); "
+        "work preserved on agent branch — requeue the task file to resume"
+    )
     _report(
         state,
         "FINAL — FAILED",
-        "task file -> failed/\nattempts: {a}\nreason: {r}".format(a=attempt, r=reason),
+        "task file -> failed/\nattempts: {a}\nreason: {r}\n"
+        "work preserved: requeue this task file to resume from the "
+        "agent branch (set `resume: false` in the front matter to "
+        "start over instead)".format(a=attempt, r=reason),
     )
     if _task_store:
         _task_store.register_artifact(

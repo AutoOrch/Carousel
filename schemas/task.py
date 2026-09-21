@@ -40,3 +40,7 @@ class Task:
     # Effective dirty base-repo policy (resolved from project/global config
     # at claim time): refuse | allow | stash.
     dirty_base_policy: str = "refuse"
+    # Resume a requeued task from its preserved agent branch (WIP from the
+    # failed run) instead of starting over from the base branch.  Set
+    # ``resume: false`` in the front matter to force a clean restart.
+    resume: bool = True

@@ -251,6 +251,7 @@ class WorkerPool:
                     "attempt_id": str((stored or {}).get("current_attempt_id") or ""),
                     "resume_checkpoint": str((stored or {}).get("checkpoint") or ""),
                     "commit": (stored or {}).get("commit_sha"),
+                    "replan_context": _prior_failure_context(stored, task),
                 },
                 config=config,
             )
@@ -277,6 +278,33 @@ class WorkerPool:
                 )
                 if not ok:
                     logger.warning(f"[pool] {task_id} heartbeat rejected (lease lost)")
+
+
+def _prior_failure_context(stored: dict | None, task: Task) -> str:
+    """Failure context of the previous run, injected on requeue.
+
+    A requeued task whose stored projection carries a failure resumes the
+    preserved agent branch; telling the agent why the earlier run died
+    turns the retry into a continuation ("fix this") instead of a redo.
+    Returns "" for first-time tasks.
+    """
+    if not stored:
+        return ""
+    failure_type = str(stored.get("failure_type") or "")
+    message = str(stored.get("failure_message") or "")
+    if not failure_type and not message:
+        return ""
+    prior_attempt = int(stored.get("attempt") or 0)
+    return (
+        "\n\n## PREVIOUS_RUN_FAILURE\n"
+        "This task failed in an earlier run"
+        + (f" (after {prior_attempt} attempt(s))" if prior_attempt else "")
+        + ". Prior progress is preserved on the agent branch — inspect the "
+        "worktree first, continue the existing work, and fix the failure "
+        "described below. Do not redo work that is already present.\n\n"
+        f"failure_type: {failure_type or 'unknown'}\n"
+        f"failure_message: {message[:2000]}\n"
+    )
 
 
 def _move_to_failed(prompt_file: Path) -> None:

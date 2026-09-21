@@ -85,6 +85,44 @@ def reset_worktree(repo: str | Path, worktree_dir: str | Path, branch: str) -> N
                 run_git(repo, "branch", "-D", branch)
 
 
+def branch_exists(repo: str | Path, branch: str) -> bool:
+    with get_project_lock(Path(repo).resolve()):
+        return bool(run_git(repo, "branch", "--list", branch).strip())
+
+
+def remove_worktree(repo: str | Path, worktree_dir: str | Path) -> None:
+    """Remove a worktree checkout but KEEP its branch (resume support)."""
+    repo = Path(repo).resolve()
+    worktree_dir = Path(worktree_dir).resolve()
+
+    with get_project_lock(repo):
+        run_git(repo, "worktree", "prune")
+        registered = run_git(repo, "worktree", "list", "--porcelain")
+        normalized = str(worktree_dir).replace("\\", "/").lower()
+        if normalized in registered.replace("\\", "/").lower():
+            run_git(repo, "worktree", "remove", "--force", str(worktree_dir))
+        elif worktree_dir.exists():
+            shutil.rmtree(worktree_dir, ignore_errors=True)
+
+
+def attach_worktree(repo: str | Path, worktree_dir: str | Path, branch: str) -> Path:
+    """Check an existing branch out into a new worktree (resume path).
+
+    Unlike :func:`create_worktree` this never creates a branch — the branch
+    must already exist and hold the preserved work of a previous run.
+    """
+    repo = Path(repo).resolve()
+    worktree_dir = Path(worktree_dir).resolve()
+    worktree_dir.parent.mkdir(parents=True, exist_ok=True)
+
+    if worktree_dir.exists():
+        raise FileExistsError(f"Worktree already exists: {worktree_dir}")
+
+    with get_project_lock(repo):
+        run_git(repo, "worktree", "add", "--checkout", str(worktree_dir), branch)
+    return worktree_dir
+
+
 def _force_remove_worktrees_on_branch(repo: Path, branch: str) -> None:
     listed = run_git(repo, "worktree", "list", "--porcelain")
     paths = [
