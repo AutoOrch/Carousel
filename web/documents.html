@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>文档运行</title>
+<link rel="stylesheet" href="/static/assets/style.css">
+<script src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js" defer></script>
+</head>
+<body>
+<nav class="nav">
+  <span class="brand">LangGraph + OpenCode Runner</span>
+  <a href="/">总览</a><a href="/runs">需求运行</a>
+  <a href="/documents" class="active">文档</a><a href="/project-docs">文档库</a>
+  <a href="/graph">依赖图</a><a href="/tasks">任务列表</a><a href="/operations">阻塞与恢复</a>
+</nav>
+<div class="container" x-data="docsPage()" x-init="load()">
+  <div class="filter-bar">
+    <button class="badge" :class="tab==='runs' ? 'RUNNING' : 'PENDING'" @click="switchTab('runs')" x-text="'归档运行 (p11) · ' + runs.length"></button>
+    <button class="badge" :class="tab==='imports' ? 'RUNNING' : 'PENDING'" @click="switchTab('imports')" x-text="'导入运行 (p13) · ' + imports.length"></button>
+    <button @click="load()">刷新</button>
+  </div>
+
+  <!-- 归档运行列表 -->
+  <div class="panel" x-show="tab==='runs'">
+    <h2>Document Runs</h2>
+    <table>
+      <thead><tr><th>Run</th><th>模式</th><th>状态</th><th>统计</th><th>创建</th><th>更新</th></tr></thead>
+      <tbody>
+        <template x-for="r in runs" :key="r.run_id">
+          <tr>
+            <td><button class="mono" @click="selectRun(r.run_id)" x-text="r.run_id"></button></td>
+            <td x-text="r.mode"></td>
+            <td><span class="badge" :class="r.status" x-text="r.status"></span></td>
+            <td class="mono small" x-text="JSON.stringify(r.stats)"></td>
+            <td class="small muted" x-text="(r.created_at||'').replace('T',' ').slice(0,19)"></td>
+            <td class="small muted" x-text="(r.updated_at||'').replace('T',' ').slice(0,19)"></td>
+          </tr>
+        </template>
+      </tbody>
+    </table>
+    <p class="muted small" x-show="!runs.length">暂无归档运行记录</p>
+  </div>
+
+  <!-- 归档运行详情 -->
+  <div class="panel" x-show="tab==='runs' && run">
+    <h2>运行详情 <span class="mono small" x-text="run?.run_id"></span></h2>
+    <p><span class="badge" :class="run?.status" x-text="run?.status"></span>
+      <span class="small muted" x-text="'report: ' + (run?.report_path || '-')"></span></p>
+    <h3>条目</h3>
+    <table>
+      <thead><tr><th>来源</th><th>项目</th><th>分类</th><th>动作</th><th>状态</th><th>置信度</th><th>目标 / 详情</th></tr></thead>
+      <tbody>
+        <template x-for="i in run?.items || []" :key="i.run_id + i.item_id">
+          <tr>
+            <td class="small" x-text="i.source_name"></td>
+            <td class="mono small" x-text="i.project_id || '-'"></td>
+            <td class="small" x-text="i.category || '-'"></td>
+            <td class="small" x-text="i.action || '-'"></td>
+            <td><span class="badge" :class="i.status" x-text="i.status"></span></td>
+            <td class="small" x-text="i.confidence != null ? i.confidence : '-'"></td>
+            <td class="mono small" x-text="i.target_path || i.detail || '-'"></td>
+          </tr>
+        </template>
+      </tbody>
+    </table>
+    <h3>事件时间线</h3>
+    <ul class="timeline">
+      <template x-for="e in run?.events || []" :key="e.event_id">
+        <li><span class="t" x-text="(e.occurred_at||'').slice(11)"></span>
+          <strong x-text="e.event_type"></strong> · <span x-text="e.status || ''"></span></li>
+      </template>
+    </ul>
+  </div>
+
+  <!-- 导入运行列表 -->
+  <div class="panel" x-show="tab==='imports'">
+    <h2>Document Import Runs</h2>
+    <table>
+      <thead><tr><th>Import</th><th>模式</th><th>状态</th><th>统计</th><th>创建</th><th>错误</th></tr></thead>
+      <tbody>
+        <template x-for="r in imports" :key="r.import_run_id">
+          <tr>
+            <td><button class="mono" @click="selectImport(r.import_run_id)" x-text="r.import_run_id"></button></td>
+            <td x-text="r.mode"></td>
+            <td><span class="badge" :class="r.status" x-text="r.status"></span></td>
+            <td class="mono small" x-text="JSON.stringify(r.stats)"></td>
+            <td class="small muted" x-text="(r.created_at||'').replace('T',' ').slice(0,19)"></td>
+            <td class="small" style="color:var(--red)" x-text="r.error || ''"></td>
+          </tr>
+        </template>
+      </tbody>
+    </table>
+    <p class="muted small" x-show="!imports.length">暂无导入运行记录</p>
+  </div>
+
+  <!-- 导入运行详情：九类子数据折叠加载展示 -->
+  <div class="panel" x-show="tab==='imports' && imp">
+    <h2>导入详情 <span class="mono small" x-text="imp?.import_run_id"></span></h2>
+    <p><span class="badge" :class="imp?.status" x-text="imp?.status"></span>
+      <span class="small mono muted" x-text="imp?.plan_path || ''"></span></p>
+    <template x-for="sec in importSections" :key="sec.key">
+      <details style="margin-bottom:10px">
+        <summary><strong x-text="sec.label"></strong>
+          <span class="muted small" x-text="'（' + ((imp?.[sec.key]||[]).length) + '）'"></span></summary>
+        <table>
+          <thead><tr><template x-for="c in sec.cols" :key="c"><th class="small" x-text="c"></th></template></tr></thead>
+          <tbody>
+            <template x-for="(row, idx) in imp?.[sec.key] || []" :key="idx">
+              <tr><template x-for="c in sec.cols" :key="c">
+                <td class="mono small" x-text="typeof row[c] === 'object' ? JSON.stringify(row[c]) : (row[c] ?? '-')"></td>
+              </template></tr>
+            </template>
+          </tbody>
+        </table>
+      </details>
+    </template>
+    <details style="margin-bottom:10px">
+      <summary><strong>事件时间线</strong> <span class="muted small" x-text="'（' + ((imp?.events||[]).length) + '）'"></span></summary>
+      <ul class="timeline">
+        <template x-for="e in imp?.events || []" :key="e.event_id">
+          <li><span class="t" x-text="(e.occurred_at||'').slice(11)"></span>
+            <strong x-text="e.event_type"></strong> · <span x-text="e.status || ''"></span></li>
+        </template>
+      </ul>
+    </details>
+  </div>
+</div>
+<script>
+function docsPage() {
+  return {
+    tab: 'runs',
+    runs: [], imports: [], run: null, imp: null,
+    importSections: [
+      {key: 'sources', label: '来源根', cols: ['source_root_id', 'input_path', 'source_type', 'project_refs', 'scan_error']},
+      {key: 'items', label: '来源文件', cols: ['relative_path', 'sha256', 'project_id', 'category', 'topic', 'status']},
+      {key: 'claims', label: '主张', cols: ['claim_id', 'claim_type', 'text', 'project_ids']},
+      {key: 'evidence', label: '证据', cols: ['project_id', 'file_path', 'line_number', 'symbol', 'method']},
+      {key: 'validations', label: '校验', cols: ['claim_id', 'project_id', 'revision', 'status', 'confidence']},
+      {key: 'repairs', label: '修复', cols: ['source_file_id', 'mode', 'draft_path', 'status']},
+      {key: 'relations', label: '关系', cols: ['source_document_id', 'target_document_id', 'relation_type', 'confidence']},
+      {key: 'clusters', label: '聚类', cols: ['cluster_id', 'topic', 'status']},
+      {key: 'summaries', label: '总结', cols: ['topic', 'path', 'status', 'updated_at']},
+    ],
+    async load() {
+      this.runs = await (await fetch('/api/document-runs')).json();
+      this.imports = await (await fetch('/api/document-imports')).json();
+    },
+    switchTab(t) { this.tab = t; },
+    async selectRun(id) { this.run = await (await fetch('/api/document-runs/' + encodeURIComponent(id))).json(); },
+    async selectImport(id) { this.imp = await (await fetch('/api/document-imports/' + encodeURIComponent(id))).json(); },
+  };
+}
+</script>
+</body></html>

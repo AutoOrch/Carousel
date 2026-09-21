@@ -3,7 +3,7 @@
 <link rel="stylesheet" href="/static/assets/style.css">
 <script src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js" defer></script></head>
 <body><nav class="nav"><span class="brand">LangGraph + OpenCode Runner</span>
-<a href="/">总览</a><a href="/runs">需求运行</a><a href="/graph">依赖图</a>
+<a href="/">总览</a><a href="/runs">需求运行</a><a href="/documents">文档</a><a href="/project-docs">文档库</a><a href="/graph">依赖图</a>
 <a href="/tasks">任务列表</a><a href="/operations" class="active">阻塞与恢复</a></nav>
 <div class="container" x-data="ops()" x-init="load()">
 <div class="panel"><h2>Blocked Tasks</h2><template x-if="!metrics.blocked?.length"><p class="muted">当前无阻塞任务</p></template>

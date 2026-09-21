@@ -607,6 +607,17 @@ def api_projects() -> list[dict[str, Any]]:
             "branch": "?",
             "tasks": [t["id"] for t in tasks if t["project"] == proj],
         })
+    # document-only projects (p14): archives written under PROJECTS_ROOT by the
+    # pipelines for stable ids that no longer appear in config.yaml or tasks
+    known = {p["id"] for p in projects}
+    if PROJECTS_ROOT.is_dir():
+        for child in sorted(PROJECTS_ROOT.iterdir()):
+            pid = child.name
+            if pid in known or pid.startswith("_"):
+                continue
+            if (documents_dir(pid) / "MANIFEST.json").is_file():
+                projects.append({"id": pid, "path": "", "branch": "?", "tasks": []})
+                known.add(pid)
     # architecture availability for every project (p10 §22)
     for p in projects:
         p["architecture"] = _architecture_summary(p["id"])
@@ -653,6 +664,73 @@ def api_project(project_id: str) -> dict[str, Any]:
 
 
 # --------------------------------------------------------------------------
+# Document library assets (p14)
+# --------------------------------------------------------------------------
+TEXT_DOC_SUFFIXES = {".md", ".markdown", ".txt", ".json", ".yaml", ".yml", ".csv", ".log"}
+
+
+def _project_documents(project_id: str) -> list[dict[str, Any]]:
+    """MANIFEST.json entries for a project — the pipeline-written whitelist
+    the file endpoint below resolves against (p14 §5: no user-supplied paths)."""
+    try:
+        manifest = documents_dir(project_id) / "MANIFEST.json"
+    except ValueError:
+        raise HTTPException(400, "unsafe project id")
+    if not manifest.is_file():
+        return []
+    try:
+        data = json.loads(manifest.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    return [d for d in (data.get("documents") or []) if isinstance(d, dict)]
+
+
+@app.get("/api/projects/{project_id}/documents")
+def api_project_documents(project_id: str) -> dict[str, Any]:
+    documents = _project_documents(project_id)
+    categories: dict[str, int] = {}
+    for entry in documents:
+        category = str(entry.get("type") or "archive")
+        categories[category] = categories.get(category, 0) + 1
+    return {
+        "project_id": project_id,
+        "documents": documents,
+        "categories": categories,
+        "summaries": _query_db(
+            "SELECT * FROM document_summaries WHERE project_id=? ORDER BY updated_at DESC",
+            (project_id,),
+        ),
+    }
+
+
+@app.get("/api/documents/{project_id}/{ref}")
+def api_document_file(project_id: str, ref: str):
+    """One archived document, addressed by manifest id or sha256 prefix."""
+    entry = next(
+        (d for d in _project_documents(project_id)
+         if str(d.get("id")) == ref or str(d.get("sha256", "")).startswith(ref)),
+        None,
+    )
+    if entry is None or not entry.get("path"):
+        raise HTTPException(404, "document not found in manifest")
+    doc_dir = documents_dir(project_id).resolve()
+    try:
+        target = (doc_dir / str(entry["path"])).resolve()
+        target.relative_to(doc_dir)
+    except ValueError:
+        raise HTTPException(403, "document outside project directory")
+    if not target.is_file():
+        raise HTTPException(404, "document file missing")
+    if target.suffix.lower() in TEXT_DOC_SUFFIXES:
+        return {
+            "project_id": project_id,
+            "document": entry,
+            "markdown": target.read_text(encoding="utf-8-sig", errors="replace"),
+        }
+    return FileResponse(target)
+
+
+# --------------------------------------------------------------------------
 # Architecture assets (p10)
 # --------------------------------------------------------------------------
 def _architecture_summary(project_id: str) -> dict[str, Any]:
@@ -696,6 +774,8 @@ def _architecture_summary(project_id: str) -> dict[str, Any]:
 def _git_head(repo_path: str) -> str:
     import subprocess
 
+    if not repo_path:
+        return ""
     try:
         result = subprocess.run(
             ["git", "rev-parse", "HEAD"],
@@ -905,6 +985,16 @@ def task_page() -> FileResponse:
 @app.get("/operations")
 def operations_page() -> FileResponse:
     return FileResponse(WEB_DIR / "operations.html")
+
+
+@app.get("/documents")
+def documents_page() -> FileResponse:
+    return FileResponse(WEB_DIR / "documents.html")
+
+
+@app.get("/project-docs")
+def project_docs_page() -> FileResponse:
+    return FileResponse(WEB_DIR / "project_docs.html")
 
 
 app.mount("/static", StaticFiles(directory=str(WEB_DIR)), name="static")

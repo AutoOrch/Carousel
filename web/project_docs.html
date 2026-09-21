@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>项目文档库</title>
+<link rel="stylesheet" href="/static/assets/style.css">
+<script src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js" defer></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@12/marked.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/dompurify@3/dist/purify.min.js"></script>
+</head>
+<body>
+<nav class="nav">
+  <span class="brand">LangGraph + OpenCode Runner</span>
+  <a href="/">总览</a><a href="/runs">需求运行</a>
+  <a href="/documents">文档</a><a href="/project-docs" class="active">文档库</a>
+  <a href="/graph">依赖图</a><a href="/tasks">任务列表</a><a href="/operations">阻塞与恢复</a>
+</nav>
+<div class="container" x-data="projectDocs()" x-init="init()">
+  <div class="filter-bar">
+    <select x-model="projectId" @change="loadDocs()">
+      <option value="">选择项目…</option>
+      <template x-for="p in projects" :key="p.id">
+        <option :value="p.id" x-text="p.id + '（' + p.document_count + ' 篇）'"></option>
+      </template>
+    </select>
+    <a class="small" href="/documents" style="align-self:center">查看文档运行 →</a>
+  </div>
+
+  <div class="panel" x-show="projectId && !docs.length">
+    <h2>文档库</h2>
+    <p class="muted">该项目暂无已归档文档（MANIFEST.json 为空或不存在）</p>
+  </div>
+
+  <div class="grid-2" :style="docs.length ? '' : 'grid-template-columns:1fr'">
+    <div>
+      <!-- 按固定分类分组，与 INDEX.md 渲染一致 -->
+      <template x-for="group in grouped" :key="group.category">
+        <div class="panel">
+          <h2><span x-text="group.category"></span> <span class="muted small" x-text="'· ' + group.items.length + ' 篇'"></span></h2>
+          <table>
+            <thead><tr><th>文档</th><th>日期</th><th>来源</th></tr></thead>
+            <tbody>
+              <template x-for="d in group.items" :key="d.id">
+                <tr>
+                  <td><button class="mono" @click="open(d)" x-text="(d.path||'').split('/').pop()"></button>
+                    <span class="muted small" x-text="' ' + (d.sha256||'').slice(0,8)"></span></td>
+                  <td class="small muted" x-text="d.created_at || '-'"></td>
+                  <td class="small muted" x-text="d.source || '-'"></td>
+                </tr>
+              </template>
+            </tbody>
+          </table>
+        </div>
+      </template>
+
+      <div class="panel" x-show="summaries.length">
+        <h2>主题总结（p13）</h2>
+        <template x-for="s in summaries" :key="s.summary_id">
+          <p class="small"><span class="mono" x-text="s.topic"></span>
+            <span class="badge" :class="s.status === 'STALE' ? 'FAILED' : 'COMPLETED'" x-text="s.status"></span>
+            <span class="muted" x-text="' ' + (s.updated_at||'').replace('T',' ').slice(0,19)"></span></p>
+        </template>
+      </div>
+    </div>
+
+    <!-- 文档内容 -->
+    <div class="panel" x-show="current">
+      <h2 x-text="currentTitle"></h2>
+      <p class="mono small muted" x-text="current?.path"></p>
+      <template x-if="currentHtml"><div class="report-body" x-html="currentHtml"></div></template>
+      <template x-if="currentRaw">
+        <div>
+          <p class="small">该文件非文本格式，<a :href="currentUrl" target="_blank">直接打开 / 下载</a></p>
+        </div>
+      </template>
+      <pre class="mono small" x-show="currentText && !currentHtml && !currentRaw" x-text="currentText" style="white-space:pre-wrap"></pre>
+    </div>
+  </div>
+</div>
+<script>
+function projectDocs() {
+  return {
+    projects: [], projectId: '', documents: [], summaries: [],
+    current: null, currentHtml: '', currentText: '', currentRaw: false,
+    categories: ['requirements','design','architecture','research','implementation',
+                 'validation','meeting','api','task','report','decision','archive'],
+    get docs() { return this.documents; },
+    get grouped() {
+      const byCat = {};
+      for (const d of this.documents) {
+        const c = d.type || 'archive';
+        (byCat[c] = byCat[c] || []).push(d);
+      }
+      const groups = Object.keys(byCat)
+        .filter(c => this.categories.includes(c))
+        .sort((a, b) => this.categories.indexOf(a) - this.categories.indexOf(b))
+        .map(c => ({category: c, items: byCat[c]}));
+      for (const c of Object.keys(byCat))
+        if (!this.categories.includes(c)) groups.push({category: c, items: byCat[c]});
+      return groups;
+    },
+    get currentTitle() { return this.current ? (this.current.path || '').split('/').pop() : ''; },
+    get currentUrl() {
+      return '/api/documents/' + encodeURIComponent(this.projectId) + '/' + encodeURIComponent(this.current?.id || '');
+    },
+    async init() {
+      this.projects = await (await fetch('/api/projects')).json();
+      const wanted = new URLSearchParams(location.search).get('project');
+      if (wanted && this.projects.some(p => p.id === wanted)) this.projectId = wanted;
+      else {
+        const withDocs = this.projects.find(p => p.document_count > 0);
+        if (withDocs) this.projectId = withDocs.id;
+      }
+      if (this.projectId) await this.loadDocs();
+    },
+    async loadDocs() {
+      this.documents = []; this.summaries = []; this.current = null;
+      if (!this.projectId) return;
+      const d = await (await fetch('/api/projects/' + encodeURIComponent(this.projectId) + '/documents')).json();
+      this.documents = d.documents || [];
+      this.summaries = d.summaries || [];
+    },
+    async open(entry) {
+      this.current = entry; this.currentHtml = ''; this.currentText = ''; this.currentRaw = false;
+      try {
+        const r = await fetch('/api/documents/' + encodeURIComponent(this.projectId) + '/' + encodeURIComponent(entry.id));
+        if (!r.ok) { this.currentText = await r.text(); return; }
+        const ctype = r.headers.get('content-type') || '';
+        if (ctype.includes('json')) {
+          const d = await r.json();
+          this.currentText = d.markdown || '';
+          if (/\.(md|markdown)$/i.test(entry.path || ''))
+            this.currentHtml = DOMPurify.sanitize(marked.parse(this.currentText));
+        } else this.currentRaw = true;
+      } catch (e) { this.currentText = String(e); }
+    },
+  };
+}
+</script>
+</body></html>
