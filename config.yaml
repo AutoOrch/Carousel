@@ -83,6 +83,10 @@ opencode:
   # endpoint and polled, so this is a wait budget, not an HTTP timeout —
   # long-running coding tasks survive.  Raise it for very large tasks.
   timeout: 7200
+  # Seconds without any message progress (no new parts / content growth)
+  # before the run counts as hung server-side (e.g. a tool call that never
+  # returns) and is aborted.  0 disables stall detection.
+  stall_timeout: 900
 
 # Architecture assets (p10) — control-plane data owned by the runner.
 architecture:

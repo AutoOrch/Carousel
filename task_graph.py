@@ -63,6 +63,7 @@ class TaskState(TypedDict, total=False):
     _lease_id: str
     _force_fail: bool
     _worker_id: str
+    _attempt_base: int
     attempt_id: str
     validation_result: dict[str, Any]
     resume_checkpoint: str
@@ -73,6 +74,18 @@ class TaskState(TypedDict, total=False):
 # ---------------------------------------------------------------------------
 def _max_attempts() -> int:
     return int(os.getenv("MAX_ATTEMPTS", "3"))
+
+
+def _effective_attempt(state: TaskState) -> int:
+    """Attempts consumed *within the current claim*.
+
+    The DB attempt counter accumulates across claims (a requeued task
+    resumes at attempt N).  The retry budget must be per claim, otherwise
+    a requeued task that already used its attempts gets one shot only.
+    """
+    attempt = state.get("attempt", 1)
+    base = state.get("_attempt_base", 0) or 0
+    return max(1, attempt - base)
 
 
 def _backoff() -> float:
@@ -805,7 +818,7 @@ def replan(state: TaskState) -> dict[str, Any]:
 
     _checkpoint(state, f"replan[{attempt}]")
 
-    if attempt >= _max_attempts():
+    if _effective_attempt(state) >= _max_attempts():
         logger.info(f"[{task.id}] replan: max_attempts={_max_attempts()} reached")
         return {}
 
@@ -1187,8 +1200,7 @@ def route_after_validate(state: TaskState) -> str:
 def route_after_replan(state: TaskState) -> str:
     if state.get("_force_fail"):
         return "finalize_failed"
-    attempt = state.get("attempt", 1)
-    if attempt >= _max_attempts():
+    if _effective_attempt(state) >= _max_attempts():
         return "finalize_failed"
     return "execute"
 

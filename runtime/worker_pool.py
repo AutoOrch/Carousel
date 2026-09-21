@@ -242,12 +242,16 @@ class WorkerPool:
         config = {"configurable": {"thread_id": task.id}}
         try:
             stored = self._task_store.get_task(task.id) if self._task_store else {}
+            claim_attempt = int((stored or {}).get("attempt") or 0)
             return self._graph.invoke(
                 {
                     "task": task,
                     "_lease_id": lease_id,
                     "_worker_id": self._worker_id,
-                    "attempt": int((stored or {}).get("attempt") or 0),
+                    "attempt": claim_attempt,
+                    # Retry budget is per claim: prior attempts from earlier
+                    # claims (a requeued task) do not consume this run's budget.
+                    "_attempt_base": claim_attempt,
                     "attempt_id": str((stored or {}).get("current_attempt_id") or ""),
                     "resume_checkpoint": str((stored or {}).get("checkpoint") or ""),
                     "commit": (stored or {}).get("commit_sha"),

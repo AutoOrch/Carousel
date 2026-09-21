@@ -563,9 +563,63 @@ class OpenCodeAsyncClientTests(unittest.TestCase):
         self.assertEqual(80, elapsed)
         self.assertEqual("partial", message["parts"][0]["text"])
 
+    def test_stalled_run_is_aborted_before_total_budget(self) -> None:
+        client = OpenCodeClient(base_url="http://test", timeout=600,
+                                poll_interval=0, stall_timeout=120)
+        streaming = {"info": {"role": "assistant", "time": {"completed": ""}},
+                     "parts": [{"type": "tool", "id": "prt_stuck"}]}
+        aborted = {"called": False}
+
+        def fake_abort(session_id):
+            aborted["called"] = True
+
+        # monotonic: start, then 60s steps — stall (120s) fires before budget.
+        ticks = iter([0.0] + [60.0 * i for i in range(2, 30)])
+        with patch.object(OpenCodeClient, "_send_async", return_value=True), \
+             patch.object(OpenCodeClient, "list_messages",
+                          return_value=[{"info": {"role": "user"}}, streaming]), \
+             patch.object(OpenCodeClient, "abort_session", side_effect=fake_abort), \
+             patch("opencode_client.time.sleep"), \
+             patch("opencode_client.time.monotonic", side_effect=lambda: next(ticks)):
+            with self.assertRaisesRegex(TimeoutError, "stalled"):
+                client.send_message("ses_x", "hung tool call")
+        self.assertTrue(aborted["called"])
+
+    def test_stall_clock_resets_on_progress(self) -> None:
+        client = OpenCodeClient(base_url="http://test", timeout=600,
+                                poll_interval=0, stall_timeout=120)
+        streaming = {"info": {"role": "assistant", "time": {"completed": ""}},
+                     "parts": [{"type": "tool", "id": "prt_1"}]}
+        done = {"info": {"role": "assistant", "time": {"completed": 1}},
+                "parts": [{"type": "text", "id": "prt_2", "text": "ok"}]}
+        polls = {"count": 0}
+
+        def growing(session_id):
+            polls["count"] += 1
+            # Every poll adds a part until the 5th, which completes —
+            # progress resets the stall clock each time.
+            if polls["count"] >= 5:
+                return [{"info": {"role": "user"}}, done]
+            part = {"type": "tool", "id": f"prt_{polls['count']}"}
+            return [{"info": {"role": "user"}},
+                    {"info": {"role": "assistant", "time": {"completed": ""}},
+                     "parts": [part]}]
+
+        ticks = iter([0.0] + [90.0 * i for i in range(1, 20)])
+        with patch.object(OpenCodeClient, "_send_async", return_value=True), \
+             patch.object(OpenCodeClient, "list_messages", side_effect=growing), \
+             patch.object(OpenCodeClient, "abort_session") as fake_abort, \
+             patch("opencode_client.time.sleep"), \
+             patch("opencode_client.time.monotonic", side_effect=lambda: next(ticks)):
+            reply = client.send_message("ses_x", "slow but alive")
+        self.assertEqual(done, reply)
+        fake_abort.assert_not_called()
+
     def test_config_rejects_bad_opencode_timeout(self) -> None:
         with self.assertRaisesRegex(ValueError, "opencode.timeout"):
             _validate_raw_config({"opencode": {"timeout": "forever"}})
+        with self.assertRaisesRegex(ValueError, "opencode.stall_timeout"):
+            _validate_raw_config({"opencode": {"stall_timeout": "never"}})
 
 
 class ResumeAfterFailureTests(unittest.TestCase):
@@ -688,6 +742,85 @@ class ResumeAfterFailureTests(unittest.TestCase):
         self.assertIn("read timeout", context)
         self.assertIn("3 attempt(s)", context)
         self.assertIn("Do not redo work", context)
+
+
+    def test_requeued_task_gets_fresh_retry_budget(self) -> None:
+        """Attempt counter persists across claims (attempt starts at 5)
+        but the retry budget must be per claim — a requeued task with
+        max_attempts=3 gets three attempts, not an instant fail."""
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            repo = init_repo(root)
+            prompt = root / "processing" / "requeued.md"
+            prompt.parent.mkdir(parents=True, exist_ok=True)
+            prompt.write_text("# requeued", encoding="utf-8")
+            calls = {"count": 0}
+
+            def flaky(task, worktree, **kwargs):
+                calls["count"] += 1
+                # First attempt of THIS claim fails; prior failure context
+                # from the earlier claim should be injected.
+                if calls["count"] == 1:
+                    self.assertIn("PREVIOUS_RUN_FAILURE", kwargs.get("replan_context", ""))
+                if calls["count"] < 3:
+                    raise RuntimeError("transient failure")
+                (Path(worktree) / "ok.txt").write_text("ok", encoding="utf-8")
+                return {"response": {"message": "## STATUS\nSUCCESS"}}
+
+            task = Task("requeued", prompt, "demo", repo, "main", "requeued")
+            env = {"EXEC_MODE": "dry-run", "MAX_ATTEMPTS": "3", "BACKOFF_SECONDS": "0"}
+            with patch.dict(os.environ, env), \
+                 patch.object(task_graph, "PROCESSED_DIR", root / "processed"), \
+                 patch.object(task_graph, "FAILED_DIR", root / "failed"), \
+                 patch.object(task_graph, "task_report_path", lambda p, t: root / "reports" / f"{t}.md"), \
+                 patch.object(task_graph, "worktree_path", lambda p, t: root / "worktrees" / p / t), \
+                 patch.object(task_graph, "run_opencode", flaky):
+                task_graph.set_task_store(None)
+                result = task_graph.build_task_graph().invoke(
+                    {
+                        "task": task,
+                        "attempt": 4,          # accumulated from prior claim
+                        "_attempt_base": 4,    # set by the worker pool
+                        "replan_context": (
+                            "\n\n## PREVIOUS_RUN_FAILURE\nThis task failed in an "
+                            "earlier run (after 4 attempt(s)).\n\nfailure_type: "
+                            "EXECUTION_ERROR\nfailure_message: read timeout\n"
+                        ),
+                    },
+                    {"configurable": {"thread_id": task.id}},
+                )
+            self.assertEqual(3, calls["count"])
+            self.assertEqual("success", result["status"])
+            self.assertTrue((root / "processed" / "requeued.md").exists())
+
+    def test_fresh_task_still_respects_max_attempts(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            repo = init_repo(root)
+            prompt = root / "processing" / "fresh.md"
+            prompt.parent.mkdir(parents=True, exist_ok=True)
+            prompt.write_text("# fresh", encoding="utf-8")
+            calls = {"count": 0}
+
+            def always_failing(task, worktree, **kwargs):
+                calls["count"] += 1
+                raise RuntimeError("nope")
+
+            task = Task("fresh", prompt, "demo", repo, "main", "fresh")
+            env = {"EXEC_MODE": "dry-run", "MAX_ATTEMPTS": "2", "BACKOFF_SECONDS": "0"}
+            with patch.dict(os.environ, env), \
+                 patch.object(task_graph, "PROCESSED_DIR", root / "processed"), \
+                 patch.object(task_graph, "FAILED_DIR", root / "failed"), \
+                 patch.object(task_graph, "task_report_path", lambda p, t: root / "reports" / f"{t}.md"), \
+                 patch.object(task_graph, "worktree_path", lambda p, t: root / "worktrees" / p / t), \
+                 patch.object(task_graph, "run_opencode", always_failing):
+                task_graph.set_task_store(None)
+                result = task_graph.build_task_graph().invoke(
+                    {"task": task},
+                    {"configurable": {"thread_id": task.id}},
+                )
+            self.assertEqual(2, calls["count"])
+            self.assertTrue((root / "failed" / "fresh.md").exists())
 
 
 class AssetSafetyTests(unittest.TestCase):

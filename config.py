@@ -60,6 +60,7 @@ DEFAULT_MAX_WORKERS = 3
 DEFAULT_POLL_INTERVAL = 2.0
 DEFAULT_OPENCODE_URL = "http://127.0.0.1:4096"
 DEFAULT_OPENCODE_TIMEOUT = 1800
+DEFAULT_OPENCODE_STALL_TIMEOUT = 900
 DIRTY_BASE_POLICIES = ("refuse", "allow", "stash")
 
 # Fallback archify entry: the locally installed skill, when present.
@@ -200,6 +201,9 @@ class Config:
     opencode_url: str = DEFAULT_OPENCODE_URL
     # Total seconds one OpenCode agent run may take (send_message budget).
     opencode_timeout: int = DEFAULT_OPENCODE_TIMEOUT
+    # Seconds without message progress before a run is considered hung
+    # server-side (e.g. a tool call that never returns) and gets aborted.
+    opencode_stall_timeout: int = DEFAULT_OPENCODE_STALL_TIMEOUT
     max_attempts: int = 3
     backoff_seconds: float = 10.0
     lease_timeout: int = 300        # seconds before a lease is considered stale
@@ -368,6 +372,9 @@ def load_config() -> Config:
         dirty_base_policy=str(worker.get("dirty_base_policy", "refuse") or "refuse").strip().lower(),
         opencode_url=opencode.get("base_url", DEFAULT_OPENCODE_URL),
         opencode_timeout=int(opencode.get("timeout", DEFAULT_OPENCODE_TIMEOUT)),
+        opencode_stall_timeout=int(
+            opencode.get("stall_timeout", DEFAULT_OPENCODE_STALL_TIMEOUT)
+        ),
         max_attempts=int(retry.get("max_attempts", 3)),
         backoff_seconds=float(retry.get("backoff_seconds", 10.0)),
         lease_timeout=int(recovery.get("lease_timeout", 300)),
@@ -408,6 +415,7 @@ def _validate_raw_config(data: dict) -> None:
         ("documents", "max_workers"): (int,),
         ("documents", "content_preview_chars"): (int,),
         ("opencode", "timeout"): (int,),
+        ("opencode", "stall_timeout"): (int,),
     }
     for (section, key), expected in checks.items():
         block = data.get(section) or {}

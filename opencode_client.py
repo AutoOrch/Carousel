@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import time
 from typing import Any, Callable
@@ -20,6 +21,14 @@ def _default_poll_interval() -> float:
         return max(0.5, float(os.getenv("OPENCODE_POLL_INTERVAL", "5")))
     except ValueError:
         return 5.0
+
+
+def _default_stall_timeout() -> int:
+    """Seconds without any message progress before a run counts as stalled."""
+    try:
+        return int(os.getenv("OPENCODE_STALL_TIMEOUT", "900"))
+    except ValueError:
+        return 900
 
 
 class OpenCodeClient:
@@ -47,6 +56,12 @@ class OpenCodeClient:
 
     ``timeout`` is the total wait budget for one agent run (not an HTTP
     read timeout).  It defaults to the OPENCODE_TIMEOUT env var (1800s).
+
+    ``stall_timeout`` is how long the reply message may show no progress
+    (no new parts, no content growth) before the run is considered hung
+    server-side — e.g. a tool call that never returns.  The session is
+    then aborted instead of waiting out the whole budget.  Defaults to
+    the OPENCODE_STALL_TIMEOUT env var (900s).
     """
 
     POLL_HTTP_TIMEOUT = 30          # per-poll HTTP timeout
@@ -57,10 +72,12 @@ class OpenCodeClient:
         base_url: str | None = None,
         timeout: int | None = None,
         poll_interval: float | None = None,
+        stall_timeout: int | None = None,
     ):
         self.base_url = (base_url or os.getenv("OPENCODE_URL", "http://127.0.0.1:4096")).rstrip("/")
         self.timeout = _default_timeout() if timeout is None else int(timeout)
         self.poll_interval = _default_poll_interval() if poll_interval is None else float(poll_interval)
+        self.stall_timeout = _default_stall_timeout() if stall_timeout is None else int(stall_timeout)
 
     def health(self) -> dict[str, Any]:
         response = requests.get(f"{self.base_url}/global/health", timeout=10)
@@ -182,6 +199,8 @@ class OpenCodeClient:
         deadline = started + self.timeout
         consecutive_errors = 0
         next_progress_at = started + 60.0
+        last_fingerprint: tuple | None = None
+        last_change = started
 
         while True:
             try:
@@ -201,6 +220,19 @@ class OpenCodeClient:
                 return reply
 
             now = time.monotonic()
+            fingerprint = self._fingerprint(reply)
+            if fingerprint != last_fingerprint:
+                last_fingerprint = fingerprint
+                last_change = now
+            elif self.stall_timeout > 0 and now - last_change > self.stall_timeout:
+                self.abort_session(session_id)
+                raise TimeoutError(
+                    f"OpenCode agent stalled: no message progress for "
+                    f"{int(now - last_change)}s (session {session_id} aborted). "
+                    f"This usually means a server-side tool call hung. "
+                    f"Raise opencode.stall_timeout / OPENCODE_STALL_TIMEOUT "
+                    f"if long silent tool runs are expected."
+                )
             if now >= deadline:
                 self.abort_session(session_id)
                 raise TimeoutError(
@@ -215,6 +247,26 @@ class OpenCodeClient:
                 except Exception:
                     on_progress = None  # a broken callback must not kill the wait
             time.sleep(self.poll_interval)
+
+    @staticmethod
+    def _fingerprint(message: dict[str, Any] | None) -> tuple | None:
+        """Progress signature of a still-streaming assistant message.
+
+        Combines part count, the last part's id and its serialized size so
+        both "new part appeared" and "existing part's content grew" count
+        as progress.
+        """
+        if not message:
+            return None
+        parts = message.get("parts") or []
+        if not parts:
+            return ("empty",)
+        last = parts[-1]
+        return (
+            len(parts),
+            str(last.get("id") or ""),
+            len(json.dumps(last, sort_keys=True, default=str)),
+        )
 
     def list_messages(self, session_id: str) -> list[dict[str, Any]]:
         response = requests.get(
