@@ -6,9 +6,10 @@ import tempfile
 import unittest
 import json
 import hashlib
+import time
 from contextlib import ExitStack
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import patch, MagicMock
 
 import planner
 import runtime.task_store as task_store_module
@@ -19,6 +20,7 @@ from document.classifier import classify_one
 from document.executor import _execute_one, _write_journal, reconcile_journals
 from document.planner import load_hash_index
 from document.schemas import ACTION_ARCHIVE, DocFile, DocumentPlan, ExtractedDoc
+from opencode_client import OpenCodeClient
 from runtime.audit_export import export_run
 import runtime.assets as assets_module
 from schemas.task import Task
@@ -431,6 +433,139 @@ class DirtyBasePolicyTests(unittest.TestCase):
             _validate_raw_config({"worker": {"dirty_base_policy": "explode"}})
         with self.assertRaisesRegex(ValueError, "dirty_base_policy"):
             _validate_raw_config({"projects": {"p": {"dirty_base_policy": "maybe"}}})
+
+
+class OpenCodeAsyncClientTests(unittest.TestCase):
+    """send_message must survive arbitrarily long agent runs."""
+
+    @staticmethod
+    def _response(status_code: int = 200, json_data=None) -> MagicMock:
+        response = MagicMock()
+        response.status_code = status_code
+        response.json.return_value = json_data
+        return response
+
+    def _client(self) -> OpenCodeClient:
+        client = OpenCodeClient(base_url="http://test", timeout=30, poll_interval=0)
+        client.POLL_HTTP_TIMEOUT = 0.1
+        return client
+
+    def test_async_send_polls_until_completed(self) -> None:
+        client = self._client()
+        streaming = {"info": {"role": "assistant", "time": {"completed": ""}},
+                     "parts": [{"type": "text", "text": "partial"}]}
+        done = {"info": {"role": "assistant", "time": {"completed": 12345}},
+                "parts": [{"type": "text", "text": "## STATUS\nSUCCESS"}]}
+        polls = {"count": 0}
+
+        def fake_post(url, **kwargs):
+            self.assertIn("/prompt_async", url)
+            return self._response(204)
+
+        def fake_list(session_id):
+            polls["count"] += 1
+            return [{"info": {"role": "user"}, "parts": []},
+                    streaming if polls["count"] < 3 else done]
+
+        with patch.object(OpenCodeClient, "_send_async", return_value=True), \
+             patch.object(OpenCodeClient, "list_messages", side_effect=fake_list):
+            reply = client.send_message("ses_x", "do the thing")
+        self.assertEqual(done, reply)
+        self.assertGreaterEqual(polls["count"], 3)
+
+    def test_timeout_aborts_session(self) -> None:
+        client = self._client()
+        streaming = {"info": {"role": "assistant", "time": {"completed": ""}},
+                     "parts": []}
+        aborted = {"called": False}
+
+        def fake_abort(session_id):
+            aborted["called"] = True
+
+        with patch.object(OpenCodeClient, "_send_async", return_value=True), \
+             patch.object(OpenCodeClient, "list_messages",
+                          return_value=[{"info": {"role": "user"}, "parts": []},
+                                        streaming]), \
+             patch.object(OpenCodeClient, "abort_session", side_effect=fake_abort), \
+             patch("opencode_client.time.sleep"):
+            with self.assertRaisesRegex(TimeoutError, "did not finish"):
+                client.send_message("ses_x", "too slow")
+        self.assertTrue(aborted["called"])
+
+    def test_transient_poll_errors_are_tolerated(self) -> None:
+        client = self._client()
+        done = {"info": {"role": "assistant", "time": {"completed": 1}},
+                "parts": [{"type": "text", "text": "ok"}]}
+        attempts = {"count": 0}
+
+        def flaky_list(session_id):
+            attempts["count"] += 1
+            if attempts["count"] % 2 == 1:
+                import requests
+                raise requests.ConnectionError("poll hiccup")
+            return [{"info": {"role": "user"}}, done]
+
+        with patch.object(OpenCodeClient, "_send_async", return_value=True), \
+             patch.object(OpenCodeClient, "list_messages", side_effect=flaky_list), \
+             patch("opencode_client.time.sleep"):
+            reply = client.send_message("ses_x", "flaky")
+        self.assertEqual(done, reply)
+
+    def test_persistent_poll_errors_raise(self) -> None:
+        import requests
+        client = self._client()
+
+        def always_fails(session_id):
+            raise requests.ConnectionError("server gone")
+
+        with patch.object(OpenCodeClient, "_send_async", return_value=True), \
+             patch.object(OpenCodeClient, "list_messages", side_effect=always_fails), \
+             patch("opencode_client.time.sleep"):
+            with self.assertRaisesRegex(RuntimeError, "polling failed"):
+                client.send_message("ses_x", "nope")
+
+    def test_falls_back_to_blocking_when_async_unavailable(self) -> None:
+        client = self._client()
+        blocked = {"info": {"role": "assistant", "time": {"completed": 1}},
+                   "parts": [{"type": "text", "text": "ok"}]}
+
+        def fake_post(url, **kwargs):
+            self.assertIn("/message", url)
+            self.assertNotIn("prompt_async", url)
+            return self._response(200, blocked)
+
+        with patch.object(OpenCodeClient, "_send_async", return_value=False), \
+             patch("opencode_client.requests.post", side_effect=fake_post):
+            reply = client.send_message("ses_x", "legacy server")
+        self.assertEqual(blocked, reply)
+
+    def test_progress_callback_receives_elapsed_and_message(self) -> None:
+        client = OpenCodeClient(base_url="http://test", timeout=100, poll_interval=0)
+        streaming = {"info": {"role": "assistant", "time": {"completed": ""}},
+                     "parts": [{"type": "text", "text": "partial"}]}
+        progress_calls: list = []
+
+        def on_progress(elapsed, message):
+            progress_calls.append((elapsed, message))
+
+        # Fake clock: monotonic() returns 0 (start), then 40, 80, 120 per
+        # loop iteration → progress fires at 80s, timeout at 120s.
+        ticks = iter([0.0, 40.0, 80.0, 120.0, 160.0])
+        with patch.object(OpenCodeClient, "_send_async", return_value=True), \
+             patch.object(OpenCodeClient, "list_messages",
+                          return_value=[{"info": {"role": "user"}}, streaming]), \
+             patch("opencode_client.time.sleep"), \
+             patch("opencode_client.time.monotonic", side_effect=lambda: next(ticks)):
+            with self.assertRaises(TimeoutError):
+                client.send_message("ses_x", "slow", on_progress=on_progress)
+        self.assertEqual(1, len(progress_calls))
+        elapsed, message = progress_calls[0]
+        self.assertEqual(80, elapsed)
+        self.assertEqual("partial", message["parts"][0]["text"])
+
+    def test_config_rejects_bad_opencode_timeout(self) -> None:
+        with self.assertRaisesRegex(ValueError, "opencode.timeout"):
+            _validate_raw_config({"opencode": {"timeout": "forever"}})
 
 
 class AssetSafetyTests(unittest.TestCase):

@@ -28,12 +28,13 @@ def _reload_safe_config(config, current_hash: str, task_store):
         return config, current_hash
     updated = load_config()
     safe_fields = (
-        "poll_interval", "opencode_url", "max_attempts", "backoff_seconds",
-        "final_review", "documents",
+        "poll_interval", "opencode_url", "opencode_timeout", "max_attempts",
+        "backoff_seconds", "final_review", "documents",
     )
     for field in safe_fields:
         setattr(config, field, getattr(updated, field))
     os.environ["OPENCODE_URL"] = config.opencode_url
+    os.environ["OPENCODE_TIMEOUT"] = str(config.opencode_timeout)
     os.environ["MAX_ATTEMPTS"] = str(config.max_attempts)
     os.environ["BACKOFF_SECONDS"] = str(config.backoff_seconds)
     os.environ["RUNNER_CONFIG_HASH"] = new_hash
@@ -210,6 +211,7 @@ def main() -> None:
     if args.mode:
         os.environ["EXEC_MODE"] = args.mode
     os.environ["OPENCODE_URL"] = config.opencode_url
+    os.environ["OPENCODE_TIMEOUT"] = str(config.opencode_timeout)
     os.environ["MAX_ATTEMPTS"] = str(config.max_attempts)
     os.environ["BACKOFF_SECONDS"] = str(config.backoff_seconds)
     active_config_hash = config_version()

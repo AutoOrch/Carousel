@@ -67,9 +67,10 @@ def diagnose_failure(
         worktree=worktree,
     )
 
-    # Diagnosis is a secondary analysis — never let it block a worker for
-    # the full 1800s message timeout; fail fast so the retry loop proceeds.
-    client = OpenCodeClient(base_url=opencode_url, timeout=600)
+    # Diagnosis is a secondary analysis — it inherits the configured agent
+    # timeout (opencode.timeout / OPENCODE_TIMEOUT).  Sending is async and
+    # polled, so this is a wait budget, not a blocking HTTP read.
+    client = OpenCodeClient(base_url=opencode_url)
     session = client.create_session(
         title=f"diagnose-{task.id}",
         directory=str(worktree),

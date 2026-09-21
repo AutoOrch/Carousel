@@ -79,6 +79,10 @@ recovery:
 
 opencode:
   base_url: http://127.0.0.1:4096
+  # Total seconds one agent run may take.  The prompt is sent via the async
+  # endpoint and polled, so this is a wait budget, not an HTTP timeout —
+  # long-running coding tasks survive.  Raise it for very large tasks.
+  timeout: 7200
 
 # Architecture assets (p10) — control-plane data owned by the runner.
 architecture:

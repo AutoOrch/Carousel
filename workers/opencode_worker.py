@@ -79,12 +79,21 @@ def run_opencode(
     client = OpenCodeClient(base_url=opencode_url)
     session = client.create_session(title=task.title, directory=str(worktree))
     session_id = session["id"]
+
+    def _progress(elapsed: float, message: dict) -> None:
+        parts = len(message.get("parts") or [])
+        logger.info(
+            f"[{task.id}] OpenCode still running ({elapsed}s elapsed, "
+            f"{parts} parts so far)"
+        )
+
     try:
         response = client.send_message(
             session_id,
             full_prompt,
             model=task.model or None,
             agent=task.agent or None,
+            on_progress=_progress,
         )
         diff = client.get_diff(session_id)
     finally:
