@@ -58,6 +58,16 @@ projects:
 worker:
   max_workers: 3
   # poll_interval: 2
+  # How CODE_CHANGE tasks handle uncommitted changes in the task's base repo:
+  #   refuse — reject the task up front, fail fast (default, safest)
+  #   allow  — log a warning and proceed; the worktree is built from HEAD so
+  #            uncommitted files never leak into the agent's sandbox; a merge
+  #            that would overwrite them fails gracefully instead
+  #   stash  — git stash the changes (incl. untracked) before the task and
+  #            restore them after finalize; a pop conflict keeps the stash
+  #            entry and is reported for manual recovery
+  # Per-project override: projects.<id>.dirty_base_policy
+  dirty_base_policy: allow
 
 retry:
   max_attempts: 3

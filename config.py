@@ -59,6 +59,7 @@ ARCHITECTURE_ROOT = DATA_ROOT / "architecture-data"
 DEFAULT_MAX_WORKERS = 3
 DEFAULT_POLL_INTERVAL = 2.0
 DEFAULT_OPENCODE_URL = "http://127.0.0.1:4096"
+DIRTY_BASE_POLICIES = ("refuse", "allow", "stash")
 
 # Fallback archify entry: the locally installed skill, when present.
 _SKILL_ARCHIFY = Path.home() / ".agents" / "skills" / "archify" / "bin" / "archify.mjs"
@@ -95,6 +96,8 @@ class Project:
     model: str = ""
     # Document pipeline (p11 §5): rule-based project identification keys.
     keywords: list[str] = field(default_factory=list)
+    # Dirty base-repo handling override: "" inherits worker.dirty_base_policy.
+    dirty_base_policy: str = ""
     architecture: ProjectArchitectureConfig = field(
         default_factory=ProjectArchitectureConfig
     )
@@ -190,6 +193,9 @@ class Config:
     projects: dict[str, Project] = field(default_factory=dict)
     max_workers: int = DEFAULT_MAX_WORKERS
     poll_interval: float = DEFAULT_POLL_INTERVAL
+    # How CODE_CHANGE tasks handle uncommitted changes in the base repo:
+    # refuse (fail fast) | allow (warn + proceed) | stash (auto-stash/pop).
+    dirty_base_policy: str = "refuse"
     opencode_url: str = DEFAULT_OPENCODE_URL
     max_attempts: int = 3
     backoff_seconds: float = 10.0
@@ -227,6 +233,7 @@ def load_config() -> Config:
             agent=opencode.get("agent", "") if isinstance(opencode, dict) else "",
             model=opencode.get("model", "") if isinstance(opencode, dict) else "",
             keywords=[str(k) for k in (pdata.get("keywords") or [])],
+            dirty_base_policy=str(pdata.get("dirty_base_policy", "") or "").strip().lower(),
             architecture=ProjectArchitectureConfig(
                 enabled=bool(arch.get("enabled", False)),
                 auto_initialize=bool(arch.get("auto_initialize", False)),
@@ -355,6 +362,7 @@ def load_config() -> Config:
         projects=projects,
         max_workers=int(worker.get("max_workers", DEFAULT_MAX_WORKERS)),
         poll_interval=float(worker.get("poll_interval", DEFAULT_POLL_INTERVAL)),
+        dirty_base_policy=str(worker.get("dirty_base_policy", "refuse") or "refuse").strip().lower(),
         opencode_url=opencode.get("base_url", DEFAULT_OPENCODE_URL),
         max_attempts=int(retry.get("max_attempts", 3)),
         backoff_seconds=float(retry.get("backoff_seconds", 10.0)),
@@ -382,6 +390,7 @@ def _validate_raw_config(data: dict) -> None:
     checks = {
         ("worker", "max_workers"): (int,),
         ("worker", "poll_interval"): (int, float),
+        ("worker", "dirty_base_policy"): (str,),
         ("retry", "max_attempts"): (int,),
         ("retry", "backoff_seconds"): (int, float),
         ("recovery", "lease_timeout"): (int,),
@@ -407,6 +416,24 @@ def _validate_raw_config(data: dict) -> None:
     projects = data.get("projects") or {}
     if not isinstance(projects, dict):
         errors.append("projects must be a mapping")
+    else:
+        worker_block = data.get("worker") or {}
+        global_policy = ""
+        if isinstance(worker_block, dict):
+            global_policy = str(worker_block.get("dirty_base_policy", "") or "").strip().lower()
+            if global_policy and global_policy not in DIRTY_BASE_POLICIES:
+                errors.append(
+                    "worker.dirty_base_policy must be one of " + "/".join(DIRTY_BASE_POLICIES)
+                )
+        for pid, pdata in projects.items():
+            if not isinstance(pdata, dict):
+                continue
+            policy = str(pdata.get("dirty_base_policy", "") or "").strip().lower()
+            if policy and policy not in DIRTY_BASE_POLICIES:
+                errors.append(
+                    f"projects.{pid}.dirty_base_policy must be one of "
+                    + "/".join(DIRTY_BASE_POLICIES)
+                )
     docs = data.get("documents") or {}
     imports = docs.get("imports") or {} if isinstance(docs, dict) else {}
     if imports and not isinstance(imports, dict):

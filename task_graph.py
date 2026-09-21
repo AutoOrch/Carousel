@@ -135,6 +135,113 @@ def _is_valid_worktree(repo: Path, worktree: Path, branch: str) -> bool:
         return False
 
 
+# ---------------------------------------------------------------------------
+# Dirty base-repo policy (robustness)
+# ---------------------------------------------------------------------------
+_STASH_PREFIX = "runner-stash:"
+
+
+def _normalize_policy(value: str) -> str:
+    policy = (value or "").strip().lower()
+    return policy if policy in ("refuse", "allow", "stash") else "refuse"
+
+
+def _dirty_files(repo: Path) -> list[str]:
+    """Uncommitted paths in the base repo (unquoted so logs stay readable)."""
+    out = run_git(repo, "-c", "core.quotepath=off", "status", "--porcelain")
+    files: list[str] = []
+    for line in out.splitlines():
+        parts = line.split(maxsplit=1)
+        if len(parts) == 2 and parts[1].strip():
+            files.append(parts[1].strip().strip('"'))
+    return files
+
+
+def _stash_base_changes(repo: Path, task_id: str) -> str:
+    """Stash uncommitted base-repo changes (dirty_base_policy=stash).
+
+    Idempotent across crash recovery: when a stash created by a previous
+    run of the same task already exists, it is kept as-is so finalize
+    restores the original state exactly once.  Returns "" on success or
+    an error message.
+    """
+    marker = f"{_STASH_PREFIX}{task_id}"
+    with get_project_lock(repo):
+        try:
+            listing = run_git(repo, "stash", "list")
+            if any(marker in line for line in listing.splitlines()):
+                logger.info(
+                    f"[{task_id}] reusing base-repo stash from a previous run"
+                )
+                return ""
+        except Exception:
+            return ""  # listing failed — let the push below surface the error
+        result = subprocess.run(
+            ["git", "stash", "push", "--include-untracked", "-m", marker],
+            cwd=str(repo), capture_output=True, text=True,
+            encoding="utf-8", errors="replace",
+        )
+        combined = (result.stdout + result.stderr)
+        if result.returncode != 0 and "no local changes" not in combined.lower():
+            return f"git stash failed: {combined.strip()[:300]}"
+        return ""
+
+
+def _restore_stash(task: Task) -> str:
+    """Pop this task's base-repo stash at finalize time (best effort).
+
+    Never raises: on conflict git keeps the stash entry, so the message
+    tells the user how to recover manually.  Returns "" when there is
+    nothing to restore.
+    """
+    repo = task.project_path
+    marker = f"{_STASH_PREFIX}{task.id}"
+    try:
+        with get_project_lock(repo):
+            listing = run_git(repo, "stash", "list")
+            if not any(marker in line for line in listing.splitlines()):
+                return ""
+            run_git(repo, "stash", "pop")
+        return ""
+    except Exception as exc:
+        return (
+            f"stash pop failed: {str(exc)[:300]} — your changes are preserved "
+            "in the stash; recover manually with 'git stash list' and "
+            "'git stash pop'"
+        )
+
+
+def _restore_base_stash(state: TaskState) -> None:
+    """Report a failed stash restore loudly instead of failing finalize."""
+    task: Task = state["task"]
+    try:
+        problem = _restore_stash(task)
+    except Exception as exc:
+        problem = str(exc)
+    if problem:
+        logger.warning(f"[{task.id}] {problem}")
+        _report(state, "Stash restore — ATTENTION", problem)
+
+
+def _prepare_failure(
+    state: TaskState, task: Task, failure_type: str, message: str
+) -> dict[str, Any]:
+    """Turn a prepare-time error into a normal failure state.
+
+    Routing it through finalize_failed (instead of raising) keeps the
+    worker alive, writes a proper report section, and moves the task
+    file to failed/ — no crash, no orphaned processing/ file.
+    """
+    logger.error(f"[{task.id}] prepare failed ({failure_type}): {message}")
+    _report(state, "Prepare — FAILED", f"type: {failure_type}\n\n{message}")
+    return {
+        "error": message,
+        "failure_type": failure_type,
+        "failure_message": message,
+        "status": "failed",
+    }
+
+
 def _cleanup_task(task: Task, worktree_path: str) -> None:
     """Remove the worktree directory and agent branch after task completion."""
     if not worktree_path:
@@ -185,26 +292,70 @@ def prepare(state: TaskState) -> dict[str, Any]:
         logger.info(f"[{task.id}] architecture task — analysing repo in place")
         return {"worktree": str(repo)}
 
-    dirty = run_git(repo, "status", "--porcelain")
-    if dirty:
-        raise RuntimeError(
-            f"base repository has uncommitted changes; refusing task {task.id}: "
-            + ", ".join(
-                (line.split(maxsplit=1)[1] if len(line.split(maxsplit=1)) > 1 else line)
-                for line in dirty.splitlines()[:10]
-            )
+    # --- Dirty base-repo policy: refuse | allow | stash ---
+    try:
+        dirty_files = _dirty_files(repo)
+    except Exception as exc:
+        return _prepare_failure(
+            state, task, "PREPARE_ERROR",
+            f"git status failed on base repository: {exc}",
         )
 
-    if attempt == 0 and not worktree.exists():
-        reset_worktree(repo, worktree, branch)
-        create_worktree(repo, worktree, branch, base_ref=task.base_branch)
-        logger.info(f"[{task.id}] worktree created: {worktree}")
-    elif worktree.exists() and _is_valid_worktree(repo, worktree, branch):
-        logger.info(f"[{task.id}] reusing existing worktree (attempt={attempt})")
-    else:
-        logger.info(f"[{task.id}] worktree stale, recreating")
-        reset_worktree(repo, worktree, branch)
-        create_worktree(repo, worktree, branch, base_ref=task.base_branch)
+    if dirty_files:
+        policy = _normalize_policy(task.dirty_base_policy)
+        preview = "\n".join(dirty_files[:20])
+        if policy == "stash":
+            stash_error = _stash_base_changes(repo, task.id)
+            if stash_error:
+                return _prepare_failure(
+                    state, task, "PREPARE_ERROR",
+                    f"failed to stash base-repo changes: {stash_error}",
+                )
+            logger.info(
+                f"[{task.id}] base repo dirty — stashed {len(dirty_files)} path(s) "
+                "(dirty_base_policy=stash); restored at finalize"
+            )
+            _report(
+                state, "Prepare — stashed base changes",
+                f"{len(dirty_files)} uncommitted path(s) stashed:\n{preview}",
+            )
+        elif policy == "allow":
+            logger.warning(
+                f"[{task.id}] base repo has {len(dirty_files)} uncommitted path(s); "
+                "proceeding (dirty_base_policy=allow)"
+            )
+            _report(
+                state, "Prepare — dirty base allowed",
+                f"uncommitted path(s) left in place:\n{preview}",
+            )
+        else:
+            return _prepare_failure(
+                state, task, "BASE_REPOSITORY_DIRTY",
+                "base repository has uncommitted changes; refusing task "
+                f"(dirty_base_policy=refuse):\n{preview}",
+            )
+
+    try:
+        if attempt == 0 and not worktree.exists():
+            reset_worktree(repo, worktree, branch)
+            create_worktree(repo, worktree, branch, base_ref=task.base_branch)
+            logger.info(f"[{task.id}] worktree created: {worktree}")
+        elif worktree.exists() and _is_valid_worktree(repo, worktree, branch):
+            logger.info(f"[{task.id}] reusing existing worktree (attempt={attempt})")
+        else:
+            logger.info(f"[{task.id}] worktree stale, recreating")
+            reset_worktree(repo, worktree, branch)
+            create_worktree(repo, worktree, branch, base_ref=task.base_branch)
+    except Exception as exc:
+        # Best-effort cleanup of a half-created worktree so nothing leaks.
+        try:
+            reset_worktree(repo, worktree, branch)
+        except Exception:
+            pass
+        return _prepare_failure(
+            state, task, "WORKTREE_ERROR",
+            f"failed to set up worktree: {exc}",
+        )
 
     return {"worktree": str(worktree)}
 
@@ -301,7 +452,10 @@ def _changed_files(worktree: Path, base_branch: str) -> list[str]:
         files.update(x.strip().replace("\\", "/") for x in diff.splitlines() if x.strip())
     except Exception:
         pass
-    status = run_git(worktree, "status", "--porcelain")
+    try:
+        status = run_git(worktree, "status", "--porcelain")
+    except Exception:
+        status = ""
     for line in status.splitlines():
         parts = line.split(maxsplit=1)
         raw = parts[1] if len(parts) == 2 else line[2:].strip()
@@ -703,9 +857,19 @@ def merge(state: TaskState) -> dict[str, Any]:
 
     lock = get_project_lock(repo)
     with lock:
-        current = run_git(repo, "rev-parse", "--abbrev-ref", "HEAD")
-        if current != task.base_branch:
-            run_git(repo, "checkout", task.base_branch)
+        try:
+            current = run_git(repo, "rev-parse", "--abbrev-ref", "HEAD")
+            if current != task.base_branch:
+                run_git(repo, "checkout", task.base_branch)
+        except Exception as exc:
+            # e.g. checkout refused because of uncommitted local changes —
+            # degrade to a normal merge error instead of crashing the graph.
+            if _task_store:
+                _task_store.finish_operation(
+                    operation_id, "FAILED", {"error": str(exc)[:2000]}
+                )
+            _report(state, "Merge", f"ERROR (checkout)\n\n{exc}")
+            return {"merge_status": "error", "error": str(exc)}
 
         logger.info(f"[{task.id}] merging {branch} into {task.base_branch}...")
         result = merge_branch(repo, branch, message=f"merge: {task.title}")
@@ -725,11 +889,20 @@ def merge(state: TaskState) -> dict[str, Any]:
             merge_head = repo / ".git" / "MERGE_HEAD"
             if merge_head.exists():
                 from worktree import commit_merge
-                commit_merge(
-                    repo,
-                    f"merge: {task.title}\n\nTask-ID: {task.id}\n"
-                    f"Attempt-ID: {state.get('attempt_id', '')}\nRun-ID: {task.run_id or '-'}",
-                )
+                try:
+                    commit_merge(
+                        repo,
+                        f"merge: {task.title}\n\nTask-ID: {task.id}\n"
+                        f"Attempt-ID: {state.get('attempt_id', '')}\nRun-ID: {task.run_id or '-'}",
+                    )
+                except Exception as exc:
+                    abort_merge(repo)
+                    if _task_store:
+                        _task_store.finish_operation(
+                            operation_id, "FAILED", {"error": str(exc)[:2000]}
+                        )
+                    _report(state, "Merge", f"ERROR (commit)\n\n{exc}")
+                    return {"merge_status": "error", "error": str(exc)}
             merge_sha = run_git(repo, "rev-parse", "HEAD")
             if _task_store:
                 _task_store.set_merge_commit(task.id, merge_sha)
@@ -792,6 +965,7 @@ def merge(state: TaskState) -> dict[str, Any]:
 def finalize_success(state: TaskState) -> dict[str, Any]:
     task: Task = state["task"]
     _checkpoint(state, "done")
+    _restore_base_stash(state)
     _cleanup_task(task, state.get("worktree", ""))
     moved = _move_task_file(task, PROCESSED_DIR)
 
@@ -836,6 +1010,7 @@ def finalize_failed(state: TaskState) -> dict[str, Any]:
         abort_merge(task.project_path)
     except Exception:
         pass
+    _restore_base_stash(state)
     _cleanup_task(task, state.get("worktree", ""))
     _move_task_file(task, FAILED_DIR)
 
@@ -914,6 +1089,14 @@ def _is_success(text: str) -> bool:
 # ---------------------------------------------------------------------------
 # Routing
 # ---------------------------------------------------------------------------
+def route_after_prepare(state: TaskState) -> str:
+    # Setup failures (dirty base repo, worktree errors) are terminal —
+    # retrying immediately cannot fix them, so skip the retry loop.
+    if state.get("error"):
+        return "finalize_failed"
+    return "execute"
+
+
 def route_after_validate(state: TaskState) -> str:
     if state.get("status") == "success":
         return "commit"
@@ -964,20 +1147,21 @@ def build_task_graph():
 
     .. code-block:: text
 
-       START → PREPARE → EXECUTE → VALIDATE
-                                 │
-                    ┌────────────┴────────────┐
-                    │ success                 │ failure
-                    ▼                         ▼
-                  COMMIT                   DIAGNOSE
-                    │                         │
-                    ▼                         ▼
-                  MERGE                     REPLAN
-                    │                         │
-              ┌─────┴─────┐          ┌────────┴────────┐
-              ▼           ▼          │ attempt < max?  │
-           SUCCESS     FAILED        ▼                 ▼
-                                       EXECUTE       FAILED
+       START → RESTORE → PREPARE ── setup error ──► FINALIZE_FAILED
+                              │
+                            EXECUTE → VALIDATE
+                                          │
+                          ┌───────────────┴───────────────┐
+                          │ success                       │ failure
+                          ▼                               ▼
+                        COMMIT                          DIAGNOSE
+                          │                               │
+                          ▼                               ▼
+                         MERGE                           REPLAN
+                          │                      ┌────────┴────────┐
+                    ┌─────┴─────┐                │ attempt < max?  │
+                    ▼           ▼                ▼                 ▼
+                 SUCCESS     FAILED            EXECUTE         FAILED
     """
     builder = StateGraph(TaskState)
 
@@ -998,7 +1182,10 @@ def build_task_graph():
         {"prepare": "prepare", "merge": "merge",
          "finalize_success": "finalize_success"},
     )
-    builder.add_edge("prepare", "execute")
+    builder.add_conditional_edges(
+        "prepare", route_after_prepare,
+        {"execute": "execute", "finalize_failed": "finalize_failed"},
+    )
     builder.add_edge("execute", "validate")
     builder.add_conditional_edges(
         "validate",

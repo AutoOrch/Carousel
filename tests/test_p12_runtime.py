@@ -6,6 +6,7 @@ import tempfile
 import unittest
 import json
 import hashlib
+from contextlib import ExitStack
 from pathlib import Path
 from unittest.mock import patch
 
@@ -295,6 +296,141 @@ class TaskGraphTests(unittest.TestCase):
             )
             self.assertEqual("failed", result["status"])
             self.assertEqual("SCOPE_VIOLATION", result["failure_type"])
+
+
+class DirtyBasePolicyTests(unittest.TestCase):
+    """Dirty base-repo handling must never crash the worker graph."""
+
+    def _invoke_graph(self, root: Path, task: Task, run_opencode=None, extra=None):
+        env = {"EXEC_MODE": "dry-run", "MAX_ATTEMPTS": "2", "BACKOFF_SECONDS": "0"}
+        patches = [
+            patch.dict(os.environ, env),
+            patch.object(task_graph, "PROCESSED_DIR", root / "processed"),
+            patch.object(task_graph, "FAILED_DIR", root / "failed"),
+            patch.object(task_graph, "task_report_path", lambda p, t: root / "reports" / f"{t}.md"),
+            patch.object(task_graph, "worktree_path", lambda p, t: root / "worktrees" / p / t),
+        ]
+        if run_opencode is not None:
+            patches.append(patch.object(task_graph, "run_opencode", run_opencode))
+        if extra:
+            patches.extend(extra)
+        with ExitStack() as stack:
+            for item in patches:
+                stack.enter_context(item)
+            task_graph.set_task_store(None)
+            return task_graph.build_task_graph().invoke(
+                {"task": task}, {"configurable": {"thread_id": task.id}}
+            )
+
+    @staticmethod
+    def _git(repo: Path, *args: str) -> str:
+        return subprocess.run(["git", *args], cwd=str(repo), check=True,
+                              capture_output=True, text=True).stdout
+
+    def _dirty_repo_task(self, root: Path, name: str, **task_kwargs) -> tuple:
+        repo = init_repo(root)
+        (repo / "notes.md").write_text("work in progress", encoding="utf-8")
+        processing = root / "processing"
+        processing.mkdir()
+        prompt = processing / f"{name}.md"
+        prompt.write_text(f"# {name}", encoding="utf-8")
+        task = Task(name, prompt, "demo", repo, "main", name, **task_kwargs)
+        return task, prompt, repo
+
+    def test_dirty_base_refuse_fails_gracefully(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            task, prompt, repo = self._dirty_repo_task(root, "dirty")
+            result = self._invoke_graph(root, task)
+            self.assertIn("uncommitted", result["error"])
+            self.assertEqual("BASE_REPOSITORY_DIRTY", result["failure_type"])
+            self.assertTrue((root / "failed" / prompt.name).exists())
+            report = (root / "reports" / "dirty.md").read_text(encoding="utf-8")
+            self.assertIn("BASE_REPOSITORY_DIRTY", report)
+            # user's uncommitted change untouched, nothing leaked
+            self.assertEqual("work in progress",
+                             (repo / "notes.md").read_text(encoding="utf-8"))
+            self.assertFalse((root / "worktrees").exists())
+
+    def test_dirty_base_allow_proceeds(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            task, prompt, repo = self._dirty_repo_task(
+                root, "allowed", dirty_base_policy="allow")
+
+            def fake(task, worktree, **kwargs):
+                (Path(worktree) / "feature.txt").write_text("done", encoding="utf-8")
+                return {"response": {"message": "## STATUS\nSUCCESS"}}
+
+            result = self._invoke_graph(root, task, run_opencode=fake)
+            self.assertEqual("", result["error"])
+            self.assertTrue((root / "processed" / prompt.name).exists())
+            # dirty change survives the whole run, merge still landed
+            self.assertEqual("work in progress",
+                             (repo / "notes.md").read_text(encoding="utf-8"))
+            self.assertEqual("done", (repo / "feature.txt").read_text(encoding="utf-8"))
+
+    def test_dirty_base_stash_roundtrip(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            task, prompt, repo = self._dirty_repo_task(
+                root, "stashed", dirty_base_policy="stash")
+            seen = {}
+
+            def fake(task, worktree, **kwargs):
+                seen["base_status"] = subprocess.run(
+                    ["git", "status", "--porcelain"], cwd=str(task.project_path),
+                    capture_output=True, text=True,
+                ).stdout
+                (Path(worktree) / "feature.txt").write_text("done", encoding="utf-8")
+                return {"response": {"message": "## STATUS\nSUCCESS"}}
+
+            result = self._invoke_graph(root, task, run_opencode=fake)
+            self.assertEqual("", result["error"])
+            # base repo was clean while the agent ran
+            self.assertEqual("", seen["base_status"].strip())
+            # ...and the user's change came back afterwards, stash drained
+            self.assertEqual("work in progress",
+                             (repo / "notes.md").read_text(encoding="utf-8"))
+            self.assertEqual("", self._git(repo, "stash", "list").strip())
+            self.assertEqual("done", (repo / "feature.txt").read_text(encoding="utf-8"))
+
+    def test_merge_checkout_failure_is_graceful(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            repo = init_repo(root)
+            subprocess.run(["git", "checkout", "-b", "other"], cwd=repo,
+                           check=True, capture_output=True)
+            processing = root / "processing"
+            processing.mkdir()
+            prompt = processing / "mergeme.md"
+            prompt.write_text("# merge", encoding="utf-8")
+
+            def fake(task, worktree, **kwargs):
+                (Path(worktree) / "feature.txt").write_text("done", encoding="utf-8")
+                return {"response": {"message": "## STATUS\nSUCCESS"}}
+
+            real_git = task_graph.run_git
+
+            def guarded(repo_arg, *args):
+                if args and args[0] == "checkout":
+                    raise RuntimeError("simulated checkout refusal")
+                return real_git(repo_arg, *args)
+
+            task = Task("mergeme", prompt, "demo", repo, "main", "mergeme")
+            result = self._invoke_graph(
+                root, task, run_opencode=fake,
+                extra=[patch.object(task_graph, "run_git", guarded)],
+            )
+            self.assertEqual("error", result["merge_status"])
+            self.assertIn("checkout", result["error"])
+            self.assertTrue((root / "failed" / prompt.name).exists())
+
+    def test_config_rejects_unknown_dirty_policy(self) -> None:
+        with self.assertRaisesRegex(ValueError, "dirty_base_policy"):
+            _validate_raw_config({"worker": {"dirty_base_policy": "explode"}})
+        with self.assertRaisesRegex(ValueError, "dirty_base_policy"):
+            _validate_raw_config({"projects": {"p": {"dirty_base_policy": "maybe"}}})
 
 
 class AssetSafetyTests(unittest.TestCase):

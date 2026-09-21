@@ -98,6 +98,11 @@ def resolve_task(task_file: Path, config: Config) -> Task:
         simulate_failure=simulate_failure,
         run_id=run_id,
         allow_empty=bool(meta.get("allow_empty", False)),
+        dirty_base_policy=(
+            project.dirty_base_policy
+            or config.dirty_base_policy
+            or "refuse"
+        ).strip().lower(),
     )
 
 

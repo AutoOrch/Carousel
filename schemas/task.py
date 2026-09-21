@@ -36,4 +36,7 @@ class Task:
     depends_on: list[str] = field(default_factory=list)
     simulate_failure: int = 0  # dry-run: fail on first N attempts (0 = never)
     run_id: str = ""           # requirement run this task belongs to
-    allow_empty: bool = False   # code tasks require a real change by default
+    allow_empty: bool = False  # code tasks require a real change by default
+    # Effective dirty base-repo policy (resolved from project/global config
+    # at claim time): refuse | allow | stash.
+    dirty_base_policy: str = "refuse"
