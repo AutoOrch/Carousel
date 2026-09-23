@@ -120,6 +120,14 @@ class ArchitectureConfig:
 
 
 @dataclass
+class PlannerConfig:
+    """Planner settings (p15: inline prompt + optional requirement expansion)."""
+    requirement_generator_enabled: bool = False
+    requirement_generator_agent: str = "build"
+    requirement_generator_model: str = ""
+
+
+@dataclass
 class FinalReviewConfig:
     enabled: bool = True
     auto_replan: bool = True
@@ -209,6 +217,7 @@ class Config:
     lease_timeout: int = 300        # seconds before a lease is considered stale
     heartbeat_interval: int = 30    # seconds between heartbeat updates
     final_review: FinalReviewConfig = field(default_factory=FinalReviewConfig)
+    planner: PlannerConfig = field(default_factory=PlannerConfig)
     architecture: ArchitectureConfig = field(default_factory=ArchitectureConfig)
     documents: DocumentsConfig = field(default_factory=DocumentsConfig)
 
@@ -260,6 +269,7 @@ def load_config() -> Config:
     final_review = data.get("final_review") or {}
     arch = data.get("architecture") or {}
     docs = data.get("documents") or {}
+    planner_raw = data.get("planner") or {}
 
     fr = FinalReviewConfig(
         enabled=bool(final_review.get("enabled", True)),
@@ -269,6 +279,13 @@ def load_config() -> Config:
         fail_on_high_risk=bool(final_review.get("fail_on_high_risk", True)),
         reviewer_agent=str(final_review.get("reviewer_agent", "plan")),
         reviewer_model=str(final_review.get("reviewer_model", "")),
+    )
+
+    rg = planner_raw.get("requirement_generator") or {} if isinstance(planner_raw, dict) else {}
+    planner_cfg = PlannerConfig(
+        requirement_generator_enabled=bool(rg.get("enabled", False)),
+        requirement_generator_agent=str(rg.get("agent", "build")),
+        requirement_generator_model=str(rg.get("model", "")),
     )
 
     def _doc_dir(key: str, default: str) -> Path:
@@ -380,6 +397,7 @@ def load_config() -> Config:
         lease_timeout=int(recovery.get("lease_timeout", 300)),
         heartbeat_interval=int(recovery.get("heartbeat_interval", 30)),
         final_review=fr,
+        planner=planner_cfg,
         architecture=ac,
         documents=dcfg,
     )
@@ -393,7 +411,7 @@ def _validate_raw_config(data: dict) -> None:
         raise ValueError("invalid config: root must be a mapping")
     allowed_sections = {
         "projects", "worker", "retry", "recovery", "opencode",
-        "architecture", "final_review", "documents", "data_root",
+        "architecture", "final_review", "documents", "data_root", "planner",
     }
     unknown = sorted(set(data) - allowed_sections)
     errors = [f"unknown top-level field: {name}" for name in unknown]

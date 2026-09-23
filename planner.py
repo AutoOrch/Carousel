@@ -68,6 +68,30 @@ PLANNER_PROMPT = """你是一个 Task Planner。
 """
 
 
+REQUIREMENT_GENERATOR_PROMPT = """你是一个需求分析师。
+
+用户输入：{raw_prompt}
+目标项目：{project_id} ({project_path})
+项目语言：{language}
+项目分支：{branch}
+
+请根据用户输入，生成一份结构化的需求文档（Markdown 格式），包含：
+
+1. # 标题
+2. ## 背景与目标
+3. ## 功能需求（逐条列出，每条有唯一编号）
+4. ## 非功能需求（性能、安全、兼容性等，如适用）
+5. ## 验收标准（逐条对应功能需求）
+6. ## 约束与假设
+
+要求：
+- 如果用户输入信息不足，在"约束与假设"中标注需要确认的事项
+- 验收标准必须可测试、可验证
+- 不要编造用户未提及的功能
+- 只输出 Markdown 正文，不要包裹在代码块中
+"""
+
+
 def _projects_block(projects: list[tuple[str, Any, str]]) -> str:
     """Format the resolved project list for the planner prompt."""
     lines = []
@@ -382,6 +406,45 @@ def _extract_title(text: str) -> str | None:
     return None
 
 
+def generate_requirement(
+    raw_prompt: str,
+    project: Any,
+    opencode_url: str = "http://127.0.0.1:4096",
+    agent: str = "build",
+    model: str = "",
+) -> str:
+    """Expand a one-liner prompt into a structured requirement document (p15).
+
+    Calls the LLM with REQUIREMENT_GENERATOR_PROMPT and returns the generated
+    Markdown.  Falls back to the raw prompt on any error so the pipeline is
+    never blocked by the expansion step.
+    """
+    prompt = REQUIREMENT_GENERATOR_PROMPT.format(
+        raw_prompt=raw_prompt,
+        project_id=project.id,
+        project_path=project.path.as_posix(),
+        language=project.language or "(unspecified)",
+        branch=project.default_branch,
+    )
+    client = OpenCodeClient(base_url=opencode_url)
+    session = client.create_session(title=f"req-gen-{project.id}")
+    session_id = session["id"]
+    try:
+        response = client.send_message(
+            session_id, prompt,
+            model=model or None,
+            agent=agent or None,
+        )
+    finally:
+        client.delete_session(session_id)
+    text = _response_text(response)
+    logger.info(f"[planner] requirement generator response length: {len(text)} chars")
+    if not text.strip():
+        logger.warning("[planner] requirement generator returned empty, using raw prompt")
+        return raw_prompt
+    return text
+
+
 def _response_text(response: Any) -> str:
     """Extract the assistant's text from an OpenCode message response.
 
@@ -408,7 +471,9 @@ def _response_text(response: Any) -> str:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Generate task files from a requirement")
-    parser.add_argument("--requirement", required=True, help="path to requirement .md file")
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--requirement", help="path to requirement .md file")
+    source.add_argument("--prompt", help="inline requirement text (one-liner, p15)")
     parser.add_argument(
         "--project",
         required=True,
@@ -424,14 +489,23 @@ def main() -> None:
         default="dry-run",
         help="planning mode (default: dry-run)",
     )
+    parser.add_argument(
+        "--expand",
+        action="store_true",
+        help="expand --prompt into a structured requirement document via LLM (p15)",
+    )
     args = parser.parse_args()
 
-    req_path = Path(args.requirement)
-    if not req_path.exists():
-        logger.error(f"Requirement file not found: {req_path}")
-        raise SystemExit(1)
+    req_path: Path | None = None
+    if args.requirement:
+        req_path = Path(args.requirement)
+        if not req_path.exists():
+            logger.error(f"Requirement file not found: {req_path}")
+            raise SystemExit(1)
+        requirement = req_path.read_text(encoding="utf-8")
+    else:
+        requirement = args.prompt or ""
 
-    requirement = req_path.read_text(encoding="utf-8")
     config = load_config()
 
     # Resolve every --project entry (comma-separated) up front.
@@ -472,6 +546,29 @@ def main() -> None:
             logger.error(f"OpenCode Server unavailable: {config.opencode_url} ({exc})")
             logger.error("Start it first:  opencode serve --hostname 127.0.0.1 --port 4096")
             raise SystemExit(2)
+
+    # p15: optionally expand a one-liner --prompt into a structured requirement
+    # document before task splitting.  Triggered by --expand flag or config
+    # planner.requirement_generator.enabled.  Only applies to inline prompts
+    # (not --requirement files) and requires opencode mode (LLM call).
+    expand_enabled = args.expand or config.planner.requirement_generator_enabled
+    if expand_enabled and args.prompt and args.mode == "opencode":
+        logger.info("[planner] expanding inline prompt into structured requirement...")
+        try:
+            requirement = generate_requirement(
+                args.prompt,
+                projects[0][1],
+                opencode_url=config.opencode_url,
+                agent=config.planner.requirement_generator_agent,
+                model=config.planner.requirement_generator_model,
+            )
+            logger.info(f"[planner] requirement expanded to {len(requirement)} chars")
+        except Exception as exc:
+            logger.warning(
+                f"[planner] requirement expansion failed ({exc}), using raw prompt"
+            )
+    elif expand_enabled and args.prompt and args.mode == "dry-run":
+        logger.info("[planner] --expand skipped in dry-run mode (no LLM)")
 
     from runtime.task_store import TaskStore
     import requirement_run

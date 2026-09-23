@@ -41,6 +41,7 @@ Before upgrading the database schema, run `python maintenance.py --backup` first
 | Entry Point | Command | Description |
 |------|------|------|
 | **Planner** | `python planner.py --requirement spec.md --project demo` | Generates task .md files from a requirement .md into `prompts/` (with dependency chains) |
+| **Inline Prompt (P15)** | `python planner.py --prompt "..." --project demo` | One-liner + project → auto-split tasks → execute (no need to write a .md file first) |
 | **P1** | `python main.py --mode dry-run` | Fixed Planner hardcodes 2 tasks, executes in parallel, then Reviews |
 | **P2-P5** | `python watcher.py --mode dry-run [--once]` | Folder watch → multi-project → resource locks → dependency scheduling → merge → crash recovery → retry loop |
 | **Document** | `python document_run.py --mode dry-run [--watch]` | Document organizer pipeline (p11): doc/ → classify → dedup → archive → index → report |
@@ -55,6 +56,7 @@ Before upgrading the database schema, run `python maintenance.py --backup` first
 - **P5 (Crash recovery + failure retry)**: SQLite state machine + Lease/Heartbeat + Diagnose → Re-plan → Retry loop.
 - **P7 (Production hardening)**: Planner requirement-to-task splitting + task dependencies (`depends_on`) + Lease Fencing + LangGraph Checkpoint + logging system + Worktree/Session cleanup + OpenCode API full-endpoint validation.
 - **P13 (Document knowledgeization)**: Read-only inventory of any explicit historical directory, frozen plan, copy-only import, code evidence validation, revision drafts, topic summarization, and near-duplicate document merge archiving.
+- **P15 (Inline prompt)**: One-liner `--prompt` + `--project` → auto-split tasks → execute, no need to write a requirement .md file first. Optional `--expand` uses LLM to expand the one-liner into a structured requirement document before splitting.
 
 ## Prerequisites
 
@@ -327,6 +329,55 @@ Generated task files automatically include front-matter (`project`, `allowed_pat
 Batch 1: task-001..005   →  Batch 2: task-006..010   →  Batch 3: task-011..014 ...
 ```
 
+## Inline Prompt (P15): One-liner + Project → Execute
+
+Instead of writing a requirement `.md` file, pass a one-liner string directly via `--prompt`
+(mutually exclusive with `--requirement`). The downstream pipeline (task split → watcher →
+execution → closure) is identical — the only difference is the input source.
+
+```powershell
+# dry-run: one-liner generates 3 test tasks with dependency chain, then execute
+.\.venv\Scripts\python.exe planner.py --prompt "Add a user points system to the project" --project demo --mode dry-run
+.\.venv\Scripts\python.exe watcher.py --mode dry-run --once
+
+# opencode: LLM analyzes the one-liner and generates structured tasks
+opencode serve --hostname 127.0.0.1 --port 4096
+.\.venv\Scripts\python.exe planner.py --prompt "Add a user points system with earning rules and leaderboard API" --project demo --mode opencode
+.\.venv\Scripts\python.exe watcher.py --mode opencode --once
+
+# Optional: expand the one-liner into a structured requirement document before splitting
+.\.venv\Scripts\python.exe planner.py --prompt "Add a user points system" --project demo --mode opencode --expand
+
+# Cross-project: comma-separated projects work the same as --requirement
+.\.venv\Scripts\python.exe planner.py --prompt "Add shared authentication between backend and frontend" --project "demo,demo2" --mode opencode
+```
+
+| Option | Description |
+|------|------|
+| `--prompt "..."` | Inline requirement text (one-liner or short description); mutually exclusive with `--requirement` |
+| `--expand` | (Optional) Use LLM to expand the one-liner into a structured requirement document (title, background, functional requirements, acceptance criteria, constraints) before task splitting. Only effective in `opencode` mode. Falls back to raw prompt on error. |
+
+The requirement snapshot is saved as `(inline prompt)` in the run metadata; the run's `requirement.md`
+snapshot contains the actual text (raw prompt or expanded version). The Closure review can trace back to it normally.
+
+**Dashboard submit**: The overview page (`/`) includes a "Quick Submit" form — select a project from the
+dropdown, type a one-liner, choose mode (dry-run/opencode), optionally check "expand", then submit.
+The `POST /api/requirement/submit` endpoint writes task `.md` files into `prompts/` via the same planner
+logic; the watcher remains the sole DB writer.
+
+**Config switch** (optional, defaults to `false`):
+
+```yaml
+planner:
+  requirement_generator:
+    enabled: false       # set true to always expand --prompt via LLM
+    # agent: build
+    # model: ""
+```
+
+When `enabled: true`, `--prompt` is always expanded (equivalent to always passing `--expand`).
+The `--expand` CLI flag takes precedence regardless.
+
 ## Task Execution Report
 
 After each task execution, a report is auto-generated at
@@ -508,6 +559,7 @@ EXECUTE → VALIDATE
 | P11 | Document organizer pipeline (7 nodes + SHA256 dedup + review safety net + MANIFEST/INDEX) | ✅ |
 | P12 | Runtime assets unified archiving by project, migration records, audit and recovery hardening | ✅ |
 | P13 | Multi-source historical read-only inventory, code validation, revision drafts and topic summarization | ✅ |
+| P15 | Inline prompt (`--prompt`) + project → auto-split → execute; optional `--expand` requirement expansion; Dashboard submit form | ✅ |
 
 ## OpenCode AI Model Configuration
 

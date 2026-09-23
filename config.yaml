@@ -78,7 +78,7 @@ recovery:
   heartbeat_interval: 30    # seconds — how often workers update heartbeat
 
 opencode:
-  base_url: http://127.0.0.1:4096
+  base_url: http://127.0.0.1:4097
   # Total seconds one agent run may take.  The prompt is sent via the async
   # endpoint and polled, so this is a wait budget, not an HTTP timeout —
   # long-running coding tasks survive.  Raise it for very large tasks.
@@ -108,6 +108,15 @@ final_review:
   fail_on_high_risk: true
   reviewer_agent: plan
   reviewer_model: ""
+
+# Planner (p15): inline prompt support + optional requirement expansion.
+# When requirement_generator.enabled is true, a one-liner --prompt is first
+# expanded into a structured requirement document via LLM before task split.
+planner:
+  requirement_generator:
+    enabled: false       # default off — one-liner goes directly to Planner
+    # agent: build
+    # model: ""
 
 # Document pipeline (p11) — drop files into doc/, they get classified,
 # deduplicated (SHA256 vs MANIFEST.json), archived under

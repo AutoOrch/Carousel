@@ -19,6 +19,40 @@
 </nav>
 
 <div class="container" x-data="dashboard()" x-init="init()">
+  <!-- 快速提交需求 (p15) -->
+  <div class="panel" x-show="projects.length > 0">
+    <h2>快速提交需求 <span class="muted small">一句话 + 项目 → 自动拆分执行</span></h2>
+    <div style="display:flex; gap:8px; align-items:flex-end; flex-wrap:wrap; margin-bottom:8px">
+      <label style="display:flex; flex-direction:column; gap:2px">
+        <span class="small muted">项目</span>
+        <select x-model="submitForm.project" style="min-width:160px">
+          <option value="">— 选择项目 —</option>
+          <template x-for="p in projects" :key="p.id">
+            <option :value="p.id" x-text="p.id + (p.path ? ' (' + p.path + ')' : '')"></option>
+          </template>
+        </select>
+      </label>
+      <label style="display:flex; flex-direction:column; gap:2px">
+        <span class="small muted">模式</span>
+        <select x-model="submitForm.mode">
+          <option value="dry-run">dry-run</option>
+          <option value="opencode">opencode</option>
+        </select>
+      </label>
+      <label style="display:flex; align-items:center; gap:4px; padding-bottom:4px">
+        <input type="checkbox" x-model="submitForm.expand">
+        <span class="small">扩写需求</span>
+      </label>
+    </div>
+    <textarea x-model="submitForm.prompt" placeholder="输入一句话需求，如：给项目增加用户积分系统" rows="2" style="width:100%; margin-bottom:8px"></textarea>
+    <button @click="submitRequirement()" :disabled="submitting || !submitForm.prompt.trim() || !submitForm.project"
+            style="padding:6px 16px">
+      <span x-show="!submitting">提交</span>
+      <span x-show="submitting">提交中…</span>
+    </button>
+    <span class="small" x-show="submitMsg" :class="submitMsgType" x-text="submitMsg" style="margin-left:8px"></span>
+  </div>
+
   <!-- 统计卡片 -->
   <div class="cards">
     <template x-for="c in statCards" :key="c.label">
@@ -102,6 +136,11 @@ function dashboard() {
     queue: { prompts: 0, blocked: 0 },
     running: [],
     recent: [],
+    projects: [],
+    submitting: false,
+    submitMsg: '',
+    submitMsgType: '',
+    submitForm: { project: '', mode: 'dry-run', prompt: '', expand: false },
     get statCards() {
       const color = { COMPLETED: 'var(--green)', RUNNING: 'var(--blue)', FAILED: 'var(--red)', PENDING: 'var(--gray)' };
       return [
@@ -111,9 +150,38 @@ function dashboard() {
     },
     async init() {
       await this.refresh();
+      await this.loadProjects();
       const es = new EventSource('/api/events/stream');
       es.onmessage = () => this.refresh();  // any store change → refresh
       es.onerror = () => {};  // EventSource auto-reconnects
+    },
+    async loadProjects() {
+      try {
+        const r = await fetch('/api/projects');
+        this.projects = await r.json();
+      } catch (e) { console.error(e); }
+    },
+    async submitRequirement() {
+      this.submitting = true;
+      this.submitMsg = '';
+      try {
+        const r = await fetch('/api/requirement/submit', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(this.submitForm),
+        });
+        const d = await r.json();
+        if (!r.ok) throw new Error(d.detail || 'submit failed');
+        this.submitMsg = `已创建 ${d.run_id}，${d.tasks_written} 个任务已入队`;
+        this.submitMsgType = '';
+        this.submitForm.prompt = '';
+        await this.refresh();
+      } catch (e) {
+        this.submitMsg = '提交失败: ' + e.message;
+        this.submitMsgType = 'muted';
+      } finally {
+        this.submitting = false;
+      }
     },
     async refresh() {
       try {

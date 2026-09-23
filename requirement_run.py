@@ -51,7 +51,7 @@ def _git_head(repo: Path) -> str:
 
 def create_run(
     task_store: TaskStore,
-    requirement_path: Path,
+    requirement_path: Path | None,
     requirement_text: str,
     projects: list[dict[str, Any]],
     planner_mode: str,
@@ -60,9 +60,15 @@ def create_run(
 
     ``projects`` entries: {"ref": normalized ref, "id": project id,
     "path": repo path (str), "branch": default branch}.
+
+    ``requirement_path`` may be None when the requirement came from an
+    inline ``--prompt`` string instead of a file; ``(inline prompt)`` is
+    used as the sentinel path in that case.
     """
     run_id = new_run_id()
     run_dir = RUNS_DIR / run_id
+
+    req_file_str = str(requirement_path.resolve()) if requirement_path else "(inline prompt)"
 
     base_revisions = {}
     for p in projects:
@@ -72,7 +78,7 @@ def create_run(
 
     plan = {
         "run_id": run_id,
-        "requirement_file": str(requirement_path.resolve()),
+        "requirement_file": req_file_str,
         "requirement_hash": requirement_hash(requirement_text),
         "planner_mode": planner_mode,
         "projects": [
@@ -90,12 +96,12 @@ def create_run(
     req_hash = plan["requirement_hash"]
     requirement_id = task_store.register_requirement(
         req_hash,
-        str(requirement_path.resolve()),
+        req_file_str,
         str((run_dir / "requirement.md").resolve()),
     )
     task_store.create_run(
         run_id=run_id,
-        requirement_file=str(requirement_path.resolve()),
+        requirement_file=req_file_str,
         requirement_hash=req_hash,
         project=",".join(p["id"] for p in projects),
         base_revision=base_revisions.get(projects[0]["ref"], ""),

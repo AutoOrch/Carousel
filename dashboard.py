@@ -25,6 +25,7 @@ from typing import Any, AsyncIterator
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
 
 from config import (
     DATA_ROOT,
@@ -275,6 +276,86 @@ def _task_events(task_id: str) -> list[dict[str, Any]]:
 # ---------------------------------------------------------------------------
 # API
 # ---------------------------------------------------------------------------
+
+class RequirementSubmitRequest(BaseModel):
+    prompt: str
+    project: str
+    mode: str = "dry-run"
+    expand: bool = False
+
+
+@app.post("/api/requirement/submit")
+def api_submit_requirement(req: RequirementSubmitRequest) -> dict[str, Any]:
+    """Submit a one-liner prompt + project → create a requirement run (p15).
+
+    Writes task .md files into prompts/ via the same planner logic as the CLI.
+    The watcher remains the sole DB writer — this endpoint only produces files.
+    """
+    if not req.prompt.strip():
+        raise HTTPException(400, "prompt must not be empty")
+    if not req.project.strip():
+        raise HTTPException(400, "project must not be empty")
+    if req.mode not in ("dry-run", "opencode"):
+        raise HTTPException(400, "mode must be dry-run or opencode")
+
+    config = load_config()
+
+    from config import get_project as _get_project
+    from planner import plan as _plan, validate_plan as _validate, write_tasks as _write, generate_requirement as _gen_req
+    from runtime.task_store import TaskStore
+    import requirement_run
+
+    projects: list[tuple[str, Any, str]] = []
+    for raw_ref in [p.strip() for p in req.project.split(",") if p.strip()]:
+        project = _get_project(config, raw_ref)
+        if project is None:
+            raise HTTPException(400, f"unknown project: {raw_ref}")
+        projects.append((raw_ref, project, raw_ref.replace("\\", "/")))
+
+    requirement = req.prompt
+    if req.expand and req.mode == "opencode":
+        try:
+            requirement = _gen_req(
+                req.prompt, projects[0][1],
+                opencode_url=config.opencode_url,
+                agent=config.planner.requirement_generator_agent,
+                model=config.planner.requirement_generator_model,
+            )
+        except Exception as exc:
+            raise HTTPException(500, f"requirement expansion failed: {exc}")
+
+    task_store = TaskStore()
+    try:
+        run_id = requirement_run.create_run(
+            task_store, None, requirement,
+            projects=[
+                {"ref": norm, "id": p.id, "path": str(p.path),
+                 "branch": p.default_branch}
+                for _, p, norm in projects
+            ],
+            planner_mode=req.mode,
+        )
+        tasks = _validate(
+            _plan(requirement, projects, mode=req.mode, opencode_url=config.opencode_url),
+            allowed_projects={item[2] for item in projects},
+        )
+        written = _write(tasks, projects[0][2], run_id=run_id)
+        requirement_run.save_plan_tasks(run_id, tasks, task_store=task_store)
+        task_store.update_run(run_id, status="QUEUED")
+    except Exception as exc:
+        task_store.close()
+        raise HTTPException(500, f"planning failed: {exc}")
+    finally:
+        task_store.close()
+
+    return {
+        "run_id": run_id,
+        "tasks_written": len(written),
+        "requirement_length": len(requirement),
+        "expanded": req.expand and req.mode == "opencode",
+    }
+
+
 @app.get("/api/summary")
 def api_summary() -> dict[str, Any]:
     tasks = _build_task_view()
